@@ -29,10 +29,6 @@ reportMissingEnv(logger);
 
 const app = express();
 app.disable('x-powered-by');
-// Behind a TLS-terminating reverse proxy (Emergent ingress, Cloudflare,
-// Railway, Render, etc.). Needed so req.ip / req.hostname reflect the
-// original client / public host rather than the internal cluster hop.
-app.set('trust proxy', true);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -42,12 +38,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Mount routes at both root (for Railway/Render/VPS deploys) and under
-// /api (required by Emergent hosting ingress which routes /api/* to the
-// backend service). Both mounts share a single router instance.
-const apiRouter = createRouter({ config, logger });
-app.use('/api', apiRouter);
-app.use('/', apiRouter);
+app.use('/', createRouter({ config, logger }));
 
 // Not-found + error handlers
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
@@ -66,13 +57,9 @@ const server = http.createServer(app);
  */
 const wss = new WebSocketServer({ noServer: true });
 
-// Accept /media-stream and /api/media-stream so Twilio can reach us on
-// both Emergent-style ingress and direct deploys.
-const WS_PATHS = ['/media-stream', '/api/media-stream'];
 server.on('upgrade', (req, socket, head) => {
-  const url = req.url || '';
-  const pathOnly = url.split('?')[0];
-  if (WS_PATHS.includes(pathOnly)) {
+  const { url } = req;
+  if (url === '/media-stream' || url?.startsWith('/media-stream?')) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
