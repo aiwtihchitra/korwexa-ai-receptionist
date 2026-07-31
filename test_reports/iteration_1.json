@@ -1,0 +1,39 @@
+{
+  "summary": "Backend-only testing of Korwexa AI Receptionist Node voice server. All 11 review checkpoints passed: HTTP routes (/, /health, /twiml) work at both root (localhost:8001) and /api/* via public ingress. TwiML correctly uses public X-Forwarded-Host in <Stream url>. WS handshake returns 101 on both /media-stream and /api/media-stream, and 404 on /wrong-path. Media Streams smoke test (scripts/test-media-stream.js) PASSED — connected/start/media/stop lifecycle handled cleanly, all expected log lines emitted, no crashes. Voice-server supervisor process still RUNNING after full test run.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_results": {
+    "GET /api/": "200 — returns service banner JSON with service, status, version, endpoints",
+    "GET /api/health": "200 — {status:'ok', uptime, timestamp}",
+    "POST /api/twiml": "200 — TwiML with wss://ai-receptionist-api-1.preview.emergentagent.com/api/media-stream (correct public host, /api prefix preserved)",
+    "GET /api/twiml": "200 — identical TwiML",
+    "GET /api/nonexistent": "404 {error:'not_found'}",
+    "GET localhost:8001/": "200 — same banner",
+    "GET localhost:8001/health": "200",
+    "POST localhost:8001/twiml": "200 — wss://localhost:8001/media-stream (root mount, no /api)",
+    "WS upgrade localhost:8001/media-stream": "HTTP 101 Switching Protocols",
+    "WS upgrade localhost:8001/api/media-stream": "HTTP 101 Switching Protocols",
+    "WS upgrade localhost:8001/wrong-path": "HTTP 404 (server logs 'Rejecting WS upgrade for unknown path')",
+    "Media Stream smoke test": "PASS (3/3 steps). Logs show 'Twilio Media Stream connected', 'Twilio stream started', 'Twilio stream stopped', 'Twilio WS closed' as expected. OpenAI Realtime socket errored out (WebSocket was closed before connection established) as expected in this env, and the bridge handled it gracefully without crashing.",
+    "Process stability": "voice-server supervisor status RUNNING after all tests, uptime persistent"
+  },
+  "test_report_links": ["/app/scripts/test-media-stream.js"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Minor: server.js instantiates the router twice (once for /api and once for /). Not a bug — but could be `const r = createRouter(...); app.use('/api', r); app.use('/', r);` to avoid double router construction.",
+    "OpenAI Realtime cannot connect from this preview env (WS closes before establishment). Not in scope per review request, but main agent should confirm outbound WSS to api.openai.com is allowed in production and that OPENAI_API_KEY, TWILIO creds in /app/.env are correct at runtime (they are set — voice-server no longer logs 'Missing environment variables')."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "N/A"},
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Node voice-server runs under supervisor program 'voice-server' on port 8001. Python 'backend' program is intentionally STOPPED. All HTTP routes are dual-mounted (root + /api). WS upgrade paths are /media-stream and /api/media-stream. Use /app/scripts/test-media-stream.js for Twilio protocol lifecycle regression. Public URL: https://ai-receptionist-api-1.preview.emergentagent.com — /api/* must be used through ingress; root paths only reachable via localhost:8001."
+}

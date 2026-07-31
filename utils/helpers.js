@@ -9,11 +9,20 @@
  * explicit PUBLIC_HOSTNAME env var or the incoming request Host header.
  * Twilio requires the URL to be publicly reachable over TLS.
  */
-function buildStreamUrl(req, publicHostname) {
-  const host = (publicHostname && publicHostname.trim()) || req.headers.host;
+function buildStreamUrl(req, publicHostname, path = '/media-stream') {
+  // Priority: explicit PUBLIC_HOSTNAME env > X-Forwarded-Host (set by
+  // reverse proxies / ingress like Cloudflare, Railway, Emergent) > Host
+  // header. Behind an ingress the raw Host header often points to the
+  // internal cluster hostname which is not reachable from Twilio.
+  const forwarded = req.headers['x-forwarded-host'];
+  const host =
+    (publicHostname && publicHostname.trim()) ||
+    (typeof forwarded === 'string' ? forwarded.split(',')[0].trim() : '') ||
+    req.headers.host;
   // Twilio Media Streams *must* be wss (secure). We assume the host runs
   // behind a TLS-terminating proxy (Railway, Render, Cloudflare, etc.).
-  return `wss://${host}/media-stream`;
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  return `wss://${host}${cleanPath}`;
 }
 
 /**
