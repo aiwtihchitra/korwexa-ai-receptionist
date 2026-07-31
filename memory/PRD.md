@@ -38,21 +38,18 @@ Twilio caller ──wss──► Express+ws (/media-stream) ──wss──► O
 ```
 
 ## What's Implemented (2026-07-31)
-- ✅ `GET /` service banner
-- ✅ `GET /health` liveness probe
-- ✅ `POST /twiml` (and `GET /twiml`) returning valid TwiML `<Connect><Stream>`
-- ✅ `WSS /media-stream` accepting Twilio Media Streams protocol
-- ✅ OpenAI Realtime WebSocket client with:
-  - session.update (system prompt, g711_ulaw in/out, server_vad, whisper transcription)
-  - streamed audio deltas → Twilio media frames
-  - barge-in (speech.started → response.cancel + Twilio clear)
-  - exponential-backoff reconnect (5 attempts, 0.5s → 8s cap)
-- ✅ Korwexa receptionist system prompt loaded verbatim from user brief
-- ✅ Zero-dep structured logger with level filter + child contexts
-- ✅ Graceful SIGINT/SIGTERM shutdown
-- ✅ Local smoke test passes (connected→start→media→stop lifecycle)
-- ✅ Supervisor entry `voice-server` running on `0.0.0.0:8001`
-- ✅ Railway-ready: binds `0.0.0.0:$PORT`, host-agnostic TwiML URL
+- ✅ `GET /` and `GET /api/` service banner
+- ✅ `GET /health` and `GET /api/health` liveness probe
+- ✅ `POST/GET /twiml` and `POST/GET /api/twiml` returning valid TwiML `<Connect><Stream>`
+- ✅ `WSS /media-stream` and `WSS /api/media-stream` accept Twilio Media Streams
+- ✅ Dual-mount so the same build runs on Emergent ingress (/api required) AND Railway/Render/VPS (root)
+- ✅ TwiML respects `X-Forwarded-Host` so the wss:// URL points at the public host, not the internal cluster hop
+- ✅ `trust proxy` enabled on Express
+- ✅ OpenAI Realtime WebSocket client with session.update, streamed audio deltas, barge-in cancel, exponential-backoff reconnect
+- ✅ Korwexa receptionist system prompt loaded verbatim
+- ✅ Zero-dep structured logger, graceful SIGINT/SIGTERM
+- ✅ Supervisor entry `voice-server` on `0.0.0.0:8001`
+- ✅ Testing agent regression PASSED — all 11 checkpoints green
 
 ## Verified
 - `curl localhost:8001/` → banner JSON ✓

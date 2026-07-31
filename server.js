@@ -44,10 +44,10 @@ app.use((req, _res, next) => {
 
 // Mount routes at both root (for Railway/Render/VPS deploys) and under
 // /api (required by Emergent hosting ingress which routes /api/* to the
-// backend service). Both mounts serve identical handlers.
+// backend service). Both mounts share a single router instance.
 const apiRouter = createRouter({ config, logger });
 app.use('/api', apiRouter);
-app.use('/', createRouter({ config, logger }));
+app.use('/', apiRouter);
 
 // Not-found + error handlers
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
