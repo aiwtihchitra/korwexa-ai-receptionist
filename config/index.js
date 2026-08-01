@@ -81,6 +81,11 @@ const config = Object.freeze({
   host: '0.0.0.0',
   logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 
+  google: {
+    clientId: process.env.GOOGLE_CLIENT_ID || '',
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+  },
+
   openai: {
     apiKey: process.env.OPENAI_API_KEY || '',
     model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-1',
