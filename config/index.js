@@ -38,7 +38,7 @@ const config = Object.freeze({
 
   openai: {
     apiKey: process.env.OPENAI_API_KEY || '',
-    model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
+    model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-1',
     voice: process.env.OPENAI_REALTIME_VOICE || 'alloy',
     // Twilio Media Streams uses G.711 μ-law @ 8kHz. The Realtime GA
     // schema expects a nested format object (e.g. { type: "audio/pcmu" });

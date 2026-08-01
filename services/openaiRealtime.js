@@ -15,11 +15,11 @@
  *      `format: { type: "audio/pcmu" }` (equivalent to the old μ-law
  *      shorthand `g711_ulaw`) for Twilio telephony audio.
  *
- *   3. Server events were renamed:
- *        response.audio.delta            -> response.output_audio.delta
- *        response.audio.done             -> response.output_audio.done
- *        response.audio_transcript.delta -> response.output_audio_transcript.delta
- *        response.audio_transcript.done  -> response.output_audio_transcript.done
+ *   3. Server events: GA uses the following event names:
+ *        response.output_audio.delta
+ *        response.output_audio.done
+ *        response.output_audio_transcript.delta
+ *        response.output_audio_transcript.done
  *
  * Everything else (Twilio μ-law bridging, server-side VAD, barge-in via
  * response.cancel + Twilio clear, whisper input transcription, exponential
@@ -151,8 +151,8 @@ class OpenAIRealtimeClient extends EventEmitter {
     }
 
     switch (event.type) {
-      // GA emits session.created on connect and session.updated after our
-      // session.update. Either signals the session is ready to accept audio.
+      // GA emits `session.created` on connect and `session.updated` after our
+      // `session.update`. Either signals the session is ready to accept audio.
       case 'session.updated':
       case 'session.created':
         if (!this.isReady) {
@@ -170,15 +170,12 @@ class OpenAIRealtimeClient extends EventEmitter {
         }
         break;
 
-      // GA audio delta events. The legacy Beta names are also matched so a
-      // partial rollback (e.g. a specific model still on Beta) keeps working.
+      // GA audio delta / done events.
       case 'response.output_audio.delta':
-      case 'response.audio.delta':
         if (event.delta) this.emit('audio', event.delta);
         break;
 
       case 'response.output_audio.done':
-      case 'response.audio.done':
         this.emit('audio.done');
         break;
 
@@ -186,9 +183,8 @@ class OpenAIRealtimeClient extends EventEmitter {
         this.emit('speech.started');
         break;
 
-      // GA renamed the assistant transcript events.
+      // GA assistant transcript events.
       case 'response.output_audio_transcript.delta':
-      case 'response.audio_transcript.delta':
         if (event.delta) {
           this.emit('transcript', {
             role: 'assistant',
@@ -199,7 +195,6 @@ class OpenAIRealtimeClient extends EventEmitter {
         break;
 
       case 'response.output_audio_transcript.done':
-      case 'response.audio_transcript.done':
         if (event.transcript) {
           this.emit('transcript', {
             role: 'assistant',

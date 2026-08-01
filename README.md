@@ -1,7 +1,7 @@
 # Korwexa AI Receptionist — Voice Server
 
 Production-ready Node.js voice server that bridges **Twilio Media Streams**
-with the **OpenAI Realtime API** (`gpt-realtime`) to power the Korwexa AI
+with the **OpenAI Realtime API** (`gpt-realtime-1`) to power the Korwexa AI
 Receptionist. No frontend is included by design — this is a backend service.
 
 ## Features
@@ -61,7 +61,7 @@ Copy `.env.example` → `.env` and fill in:
 | `TWILIO_ACCOUNT_SID`  | yes      | Twilio Account SID                                 |
 | `TWILIO_AUTH_TOKEN`   | yes      | Twilio Auth Token                                  |
 | `PORT`                | no       | HTTP port (default `8001`)                         |
-| `OPENAI_REALTIME_MODEL` | no     | Default `gpt-realtime`                             |
+| `OPENAI_REALTIME_MODEL` | no     | Default `gpt-realtime-1`                           |
 | `OPENAI_REALTIME_VOICE` | no     | Default `alloy` (alloy / echo / shimmer / …)       |
 | `LOG_LEVEL`           | no       | `debug` / `info` / `warn` / `error`                |
 | `PUBLIC_HOSTNAME`     | no       | Overrides `Host` header when building TwiML URL    |
@@ -127,11 +127,11 @@ from an older Beta build:
     `g711_ulaw` in config is auto-converted by the client).
   - `turn_detection` and `transcription` now live inside `audio.input`.
   - `voice` now lives inside `audio.output`.
-- Server events renamed and handled by this client:
-  - `response.audio.delta` → `response.output_audio.delta`
-  - `response.audio.done` → `response.output_audio.done`
-  - `response.audio_transcript.delta` → `response.output_audio_transcript.delta`
-  - `response.audio_transcript.done` → `response.output_audio_transcript.done`
+- Server events now use GA names (handled by this client):
+  - `response.output_audio.delta`
+  - `response.output_audio.done`
+  - `response.output_audio_transcript.delta`
+  - `response.output_audio_transcript.done`
 - Initial greeting now uses `conversation.item.create` + `response.create`
   with `response.output_modalities`.
 
