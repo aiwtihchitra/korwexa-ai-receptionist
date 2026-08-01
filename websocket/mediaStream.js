@@ -35,6 +35,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let markCounter = 0;
   let finalGoodbyeDetected = false;
   let disconnectScheduled = false;
+  let autoContinueTimer = null;
+  let awaitingAutoContinue = false;
+  let autoContinueSent = false;
 
   const openai = new OpenAIRealtimeClient({
     config: config.openai,
@@ -78,6 +81,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   openai.on('transcript', ({ role, text, partial }) => {
     if (!partial) {
       logger.info('transcript', { role, text });
+
+      if (!autoContinueSent && /please give me a moment while I check/i.test(text)) {
+        awaitingAutoContinue = true;
+        scheduleAutoContinue();
+      }
+
       if (!finalGoodbyeDetected && /thank you for calling .*have a wonderful day\. goodbye\./i.test(text)) {
         finalGoodbyeDetected = true;
         scheduleDisconnectIfNeeded();
@@ -176,6 +185,20 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     } catch {
       /* noop */
     }
+  }
+
+  function scheduleAutoContinue() {
+    if (autoContinueTimer || !awaitingAutoContinue || autoContinueSent) return;
+    autoContinueTimer = setTimeout(() => {
+      autoContinueTimer = null;
+      if (closed || !streamSid || !awaitingAutoContinue) return;
+      awaitingAutoContinue = false;
+      autoContinueSent = true;
+      logger.info('Auto-continuing after moment pause');
+      openai.sendTextInstruction(
+        'Please continue the booking by saying: "Thank you for waiting. We have appointments available tomorrow at 10:30 AM and 3:00 PM. Which time works best for you?"'
+      );
+    }, 1500);
   }
 
   function scheduleDisconnectIfNeeded() {

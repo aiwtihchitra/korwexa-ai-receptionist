@@ -331,6 +331,30 @@ class OpenAIRealtimeClient extends EventEmitter {
     });
   }
 
+  sendTextInstruction(text) {
+    if (!text) return false;
+    this._send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text,
+          },
+        ],
+      },
+    });
+    this._send({
+      type: 'response.create',
+      response: {
+        output_modalities: ['audio'],
+      },
+    });
+    return true;
+  }
+
   close() {
     this.isClosed = true;
     if (this.ws) {
