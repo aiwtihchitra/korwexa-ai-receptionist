@@ -52,6 +52,10 @@ async function ensureCalendarClient({ clientId, clientSecret, redirectUri, busin
   return calendar;
 }
 
+function hasBusinessCalendarConnection({ clientId, clientSecret, redirectUri, business }) {
+  return Boolean(getOAuthClientForBusiness({ clientId, clientSecret, redirectUri, business }));
+}
+
 async function checkAvailability({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', timeMin, timeMax }) {
   const calendar = await ensureCalendarClient({ clientId, clientSecret, redirectUri, business });
   const response = await calendar.freebusy.query({
@@ -162,4 +166,5 @@ module.exports = {
   createAppointment,
   updateAppointment,
   cancelAppointment,
+  hasBusinessCalendarConnection,
 };

@@ -137,7 +137,11 @@ function createRouter({ config, logger }) {
     const host = req.get('host');
     const protocol = req.protocol;
     const redirectUri = `${protocol}://${host}${req.baseUrl || ''}/auth/google/callback`;
-    const business = config.openai.businessName;
+    const business = (req.query.business || config.openai.businessName || '').trim();
+    if (!business) {
+      return res.status(400).json({ error: 'business query parameter is required for smoke-test' });
+    }
+
     const now = DateTime.now().setZone(config.businessTimeZone);
     const smokeWindowStart = now.plus({ minutes: 10 });
     const smokeWindowEnd = smokeWindowStart.plus({ days: 1 });
@@ -162,6 +166,14 @@ function createRouter({ config, logger }) {
       result.availability.slots = availableSlots.length;
     } catch (err) {
       const message = err?.message || 'Google Calendar request failed';
+      if (message.includes('No Google Calendar credentials found for business')) {
+        return res.status(200).json({
+          googleAuth: { pass: false, error: 'Google Calendar not connected for this business.' },
+          availability: { pass: false, error: 'Google Calendar not connected for this business.', slots: 0 },
+          appointment: { pass: false, error: null },
+          email: { pass: false, error: null },
+        });
+      }
       result.googleAuth.error = message;
       result.availability.error = message;
       return res.status(200).json(result);
