@@ -17,6 +17,7 @@
 
 const express = require('express');
 const { buildStreamUrl, escapeXml } = require('../utils/helpers');
+const { getAuthUrl, exchangeCode } = require('../services/googleCalendar');
 
 function createRouter({ config, logger }) {
   const router = express.Router();
@@ -30,6 +31,8 @@ function createRouter({ config, logger }) {
         health: 'GET /health (also /api/health)',
         twiml: 'POST /twiml (also /api/twiml)',
         mediaStream: 'WSS /media-stream (also /api/media-stream)',
+        googleAuth: 'GET /auth/google (also /api/auth/google)',
+        googleCallback: 'GET /auth/google/callback (also /api/auth/google/callback)',
       },
     });
   });
@@ -64,6 +67,51 @@ function createRouter({ config, logger }) {
   };
   router.post('/twiml', twimlHandler);
   router.get('/twiml', twimlHandler);
+
+  router.get('/auth/google', (req, res) => {
+    try {
+      const business = (req.query.business || req.query.biz || '').trim();
+      if (!business) {
+        return res.status(400).json({ error: 'business query parameter is required' });
+      }
+      const host = req.get('host');
+      const protocol = req.protocol;
+      const redirectUri = `${protocol}://${host}${req.baseUrl || ''}/auth/google/callback`;
+      const authUrl = getAuthUrl({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+      });
+      res.redirect(authUrl);
+    } catch (err) {
+      logger.error('Google auth redirect failed', { error: err.message });
+      res.status(500).json({ error: 'Failed to start Google OAuth flow' });
+    }
+  });
+
+  router.get('/auth/google/callback', async (req, res) => {
+    const { code, state: business } = req.query;
+    if (!code || !business) {
+      return res.status(400).json({ error: 'Missing code or state (business)' });
+    }
+    try {
+      const host = req.get('host');
+      const protocol = req.protocol;
+      const redirectUri = `${protocol}://${host}${req.baseUrl || ''}/auth/google/callback`;
+      await exchangeCode({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        code,
+        business,
+      });
+      res.send(`Google Calendar connected for ${business}. You may now return to the receptionist dashboard.`);
+    } catch (err) {
+      logger.error('Google OAuth callback failed', { error: err.message, business });
+      res.status(500).json({ error: 'Failed to complete Google OAuth callback' });
+    }
+  });
 
   return router;
 }

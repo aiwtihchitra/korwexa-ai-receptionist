@@ -20,6 +20,11 @@
  */
 
 const { OpenAIRealtimeClient } = require('../services/openaiRealtime');
+const {
+  checkAvailability,
+  createAppointment,
+  updateAppointment,
+} = require('../services/googleCalendar');
 const { generateConnectionId } = require('../utils/helpers');
 
 function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
@@ -38,6 +43,16 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let autoContinueTimer = null;
   let awaitingAutoContinue = false;
   let autoContinueSent = false;
+  let availableSlots = [];
+  let selectedSlot = null;
+  let eventId = null;
+  let currentAppointmentDetails = {
+    name: null,
+    email: null,
+    phone: null,
+    date: null,
+    time: null,
+  };
 
   const openai = new OpenAIRealtimeClient({
     config: config.openai,
@@ -82,14 +97,20 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     if (!partial) {
       logger.info('transcript', { role, text });
 
-      if (!autoContinueSent && /please give me a moment while I check/i.test(text)) {
-        awaitingAutoContinue = true;
-        scheduleAutoContinue();
+      if (role === 'assistant') {
+        if (!autoContinueSent && /please give me a moment while I check/i.test(text)) {
+          awaitingAutoContinue = true;
+          scheduleAutoContinue();
+        }
+
+        if (!finalGoodbyeDetected && /thank you for calling .*have a wonderful day\. goodbye\./i.test(text)) {
+          finalGoodbyeDetected = true;
+          scheduleDisconnectIfNeeded();
+        }
       }
 
-      if (!finalGoodbyeDetected && /thank you for calling .*have a wonderful day\. goodbye\./i.test(text)) {
-        finalGoodbyeDetected = true;
-        scheduleDisconnectIfNeeded();
+      if (role === 'user') {
+        handleUserTranscript(text);
       }
     }
   });
@@ -189,16 +210,233 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
   function scheduleAutoContinue() {
     if (autoContinueTimer || !awaitingAutoContinue || autoContinueSent) return;
-    autoContinueTimer = setTimeout(() => {
+    autoContinueTimer = setTimeout(async () => {
       autoContinueTimer = null;
       if (closed || !streamSid || !awaitingAutoContinue) return;
       awaitingAutoContinue = false;
       autoContinueSent = true;
       logger.info('Auto-continuing after moment pause');
-      openai.sendTextInstruction(
-        'Please continue the booking by saying: "Thank you for waiting. We have appointments available tomorrow at 10:30 AM and 3:00 PM. Which time works best for you?"'
-      );
+      await offerAvailableSlots();
     }, 1500);
+  }
+
+  async function offerAvailableSlots() {
+    const redirectUri = getGoogleRedirectUri();
+    const business = config.openai.businessName;
+    const candidateSlots = getCandidateSlots();
+    const available = [];
+
+    for (const slot of candidateSlots) {
+      try {
+        const status = await checkAvailability({
+          clientId: config.google.clientId,
+          clientSecret: config.google.clientSecret,
+          redirectUri,
+          business,
+          calendarId: 'primary',
+          timeMin: slot.start.toISOString(),
+          timeMax: slot.end.toISOString(),
+        });
+        if (status === 'available') {
+          available.push(slot);
+        }
+      } catch (err) {
+        logger.error('Calendar availability check failed', { error: err.message, business });
+        openai.sendTextInstruction(
+          'I\'m sorry, I can\'t access the calendar right now. Please let me know the date and time you need, and I will follow up once the calendar connection is restored.'
+        );
+        return;
+      }
+    }
+
+    availableSlots = available;
+    if (!availableSlots.length) {
+      logger.info('No available slots returned by calendar');
+      openai.sendTextInstruction(
+        'Thank you for waiting. I checked the calendar and it looks like tomorrow is fully booked. Would another day work for you?'
+      );
+      return;
+    }
+
+    const slotText = availableSlots.map((slot) => slot.label).join(' and ');
+    const verb = availableSlots.length === 1 ? 'is' : 'are';
+    openai.sendTextInstruction(
+      `Thank you for waiting. We have the following openings ${slotText}. Which time works best for you?`
+    );
+  }
+
+  function getCandidateSlots() {
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+
+    const buildSlot = (hour, minute) => {
+      const start = new Date(tomorrow);
+      start.setHours(hour, minute, 0, 0);
+      const end = new Date(start.getTime() + 30 * 60 * 1000);
+      return {
+        label: start.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true,
+        }).replace(/\u202F/g, ' '),
+        start,
+        end,
+      };
+    };
+
+    return [buildSlot(10, 30), buildSlot(15, 0)];
+  }
+
+  function getGoogleRedirectUri() {
+    const basePath = getRequestBasePath();
+    if (config.publicHostname && config.publicHostname.trim()) {
+      return `https://${config.publicHostname}${basePath}/auth/google/callback`;
+    }
+    return `http://localhost:${config.port}${basePath}/auth/google/callback`;
+  }
+
+  function getRequestBasePath() {
+    const path = (req.url || '').split('?')[0];
+    return path.startsWith('/api/') ? '/api' : '';
+  }
+
+  function handleUserTranscript(text) {
+    const normalized = text.trim();
+    const name = parseName(normalized);
+    const email = parseEmail(normalized);
+    const phone = parsePhone(normalized);
+    const selected = parseSelectedSlot(normalized);
+
+    if (name) {
+      currentAppointmentDetails.name = name;
+      logger.debug('Captured name from user transcript', { name });
+    }
+    if (email) {
+      currentAppointmentDetails.email = email;
+      logger.debug('Captured email from user transcript', { email });
+    }
+    if (phone) {
+      currentAppointmentDetails.phone = phone.replace(/[^\d+]/g, '');
+      logger.debug('Captured phone from user transcript', { phone: currentAppointmentDetails.phone });
+    }
+    if (selected && !selectedSlot) {
+      selectedSlot = selected;
+      logger.info('Caller selected an available slot', { slot: selectedSlot.label });
+      attemptCreateAppointment();
+    }
+
+    if (eventId) {
+      updateExistingAppointment();
+    }
+  }
+
+  function parseName(text) {
+    const match = text.match(/(?:my name is|this is|I am|I'm|it\'s)\s+([A-Za-z][A-Za-z\s'-]{1,60})/i);
+    return match ? match[1].trim() : null;
+  }
+
+  function parseEmail(text) {
+    const match = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/i);
+    return match ? match[0].trim() : null;
+  }
+
+  function parsePhone(text) {
+    const match = text.match(/(\+?\d[\d\s().-]{6,}\d)/);
+    return match ? match[0].trim() : null;
+  }
+
+  function parseSelectedSlot(text) {
+    if (!availableSlots.length) return null;
+    const match = text.match(/(\d{1,2}(?::\d{2})?)\s*(am|pm)/i);
+    if (!match) return null;
+    const normalized = match[0].toLowerCase();
+    return availableSlots.find((slot) => slot.label.toLowerCase().includes(normalized)) || null;
+  }
+
+  async function attemptCreateAppointment() {
+    if (!selectedSlot || eventId) return;
+    const redirectUri = getGoogleRedirectUri();
+    const business = config.openai.businessName;
+    const summary = `${config.openai.businessName} Appointment`;
+    const description = [`Booked via voice receptionist.`];
+    if (currentAppointmentDetails.name) {
+      description.push(`Name: ${currentAppointmentDetails.name}`);
+    }
+    if (currentAppointmentDetails.phone) {
+      description.push(`Phone: ${currentAppointmentDetails.phone}`);
+    }
+    if (currentAppointmentDetails.email) {
+      description.push(`Email: ${currentAppointmentDetails.email}`);
+    }
+
+    try {
+      const event = await createAppointment({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+        calendarId: 'primary',
+        summary,
+        description: description.join('\n'),
+        start: selectedSlot.start,
+        end: selectedSlot.end,
+        guests: currentAppointmentDetails.email ? [currentAppointmentDetails.email] : [],
+      });
+      eventId = event.id;
+      logger.info('Created calendar appointment', { eventId, slot: selectedSlot.label });
+      openai.sendTextInstruction(
+        `Your appointment has been scheduled for ${selectedSlot.label}. ` +
+          `If you have any additional details, I will add them to your booking now.`
+      );
+    } catch (err) {
+      logger.error('Failed to create calendar appointment', { error: err.message, business });
+      openai.sendTextInstruction(
+        'I\'m sorry, I couldn\'t book that appointment at the moment. Can I try again or would you like a different time?'
+      );
+    }
+  }
+
+  async function updateExistingAppointment() {
+    if (!eventId) return;
+    const redirectUri = getGoogleRedirectUri();
+    const business = config.openai.businessName;
+    const updates = {};
+
+    if (currentAppointmentDetails.email) {
+      updates.attendees = [{ email: currentAppointmentDetails.email }];
+    }
+    if (currentAppointmentDetails.name || currentAppointmentDetails.phone || currentAppointmentDetails.email) {
+      const description = [`Booked via voice receptionist.`];
+      if (currentAppointmentDetails.name) {
+        description.push(`Name: ${currentAppointmentDetails.name}`);
+      }
+      if (currentAppointmentDetails.phone) {
+        description.push(`Phone: ${currentAppointmentDetails.phone}`);
+      }
+      if (currentAppointmentDetails.email) {
+        description.push(`Email: ${currentAppointmentDetails.email}`);
+      }
+      updates.description = description.join('\n');
+    }
+
+    if (!Object.keys(updates).length) return;
+
+    try {
+      await updateAppointment({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+        calendarId: 'primary',
+        eventId,
+        updates,
+      });
+      logger.info('Updated existing calendar appointment', { eventId });
+    } catch (err) {
+      logger.error('Failed to update calendar appointment', { error: err.message, business });
+    }
   }
 
   function scheduleDisconnectIfNeeded() {
