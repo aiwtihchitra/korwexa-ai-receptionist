@@ -7,6 +7,7 @@ Receptionist. No frontend is included by design — this is a backend service.
 ## Features
 
 - Express + `ws` (native Node.js WebSocket).
+- **OpenAI Realtime GA** API (`/v1/realtime`, no `OpenAI-Beta` header).
 - Bi-directional audio streaming between Twilio (μ-law 8 kHz) and OpenAI
   Realtime — no local transcoding, sub-second latency.
 - Server-side VAD with barge-in handling (the assistant stops talking the
@@ -111,3 +112,29 @@ The same build runs unchanged on Render, Fly.io, or any VPS.
   100–300 ms off the first assistant word.
 - `perMessageDeflate` is disabled on the OpenAI socket for lowest per-frame
   overhead.
+
+## OpenAI Realtime GA Migration
+
+This project targets the **GA** Realtime interface. If you are upgrading
+from an older Beta build:
+
+- The `OpenAI-Beta: realtime=v1` request header is **removed**.
+- `session.update` now uses the GA schema:
+  - `session.type = "realtime"`
+  - `output_modalities` replaces `modalities`
+  - Audio config moved under `audio.input` / `audio.output`
+  - `format: { type: "audio/pcmu" }` for μ-law (the shorthand
+    `g711_ulaw` in config is auto-converted by the client).
+  - `turn_detection` and `transcription` now live inside `audio.input`.
+  - `voice` now lives inside `audio.output`.
+- Server events renamed and handled by this client:
+  - `response.audio.delta` → `response.output_audio.delta`
+  - `response.audio.done` → `response.output_audio.done`
+  - `response.audio_transcript.delta` → `response.output_audio_transcript.delta`
+  - `response.audio_transcript.done` → `response.output_audio_transcript.done`
+- Initial greeting now uses `conversation.item.create` + `response.create`
+  with `response.output_modalities`.
+
+Twilio Media Streams, `g711_ulaw` end-to-end, server VAD, barge-in,
+input transcription, reconnect logic, and Railway compatibility are all
+preserved.

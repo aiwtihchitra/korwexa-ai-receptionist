@@ -1,32 +1,61 @@
 'use strict';
 
 /**
- * OpenAI Realtime API client for the Korwexa voice bridge.
+ * OpenAI Realtime API (GA) client for the Korwexa voice bridge.
  *
- * Responsibilities:
- *  - Open a WebSocket to wss://api.openai.com/v1/realtime?model=<model>
- *  - Authenticate via Bearer token + OpenAI-Beta: realtime=v1 header
- *  - Send session.update (system prompt, voice, μ-law audio, server VAD)
- *  - Expose helpers to forward Twilio audio in and stream audio out
- *  - Handle reconnect with exponential backoff (bounded)
+ * Migrated from the legacy Beta interface (`OpenAI-Beta: realtime=v1`) which
+ * was removed by OpenAI. The GA interface differs in three important ways:
  *
- * This class is intentionally small — the audio bridging logic lives in
- * /websocket/mediaStream.js so this file stays framework/transport-agnostic.
+ *   1. No `OpenAI-Beta` header — the plain `wss://api.openai.com/v1/realtime`
+ *      endpoint now serves the GA schema by default.
  *
- * Events emitted:
- *   'open'        - session is ready (after session.update ack)
- *   'audio'       - (base64Ulaw) chunk of assistant speech ready to play out
- *   'audio.done'  - assistant finished speaking a response
+ *   2. `session.update` moved audio config under a nested `audio.input` /
+ *      `audio.output` object, replaced `modalities` with `output_modalities`,
+ *      added `session.type: "realtime"`, and now expects
+ *      `format: { type: "audio/pcmu" }` (equivalent to the old μ-law
+ *      shorthand `g711_ulaw`) for Twilio telephony audio.
+ *
+ *   3. Server events were renamed:
+ *        response.audio.delta            -> response.output_audio.delta
+ *        response.audio.done             -> response.output_audio.done
+ *        response.audio_transcript.delta -> response.output_audio_transcript.delta
+ *        response.audio_transcript.done  -> response.output_audio_transcript.done
+ *
+ * Everything else (Twilio μ-law bridging, server-side VAD, barge-in via
+ * response.cancel + Twilio clear, whisper input transcription, exponential
+ * backoff reconnect) is preserved.
+ *
+ * Events emitted by this class (unchanged public API):
+ *   'open'           - session is ready (after session.updated / session.created)
+ *   'audio'          - (base64 μ-law) chunk of assistant speech ready to play
+ *   'audio.done'     - assistant finished the current audio response
  *   'speech.started' - user started speaking (barge-in cue)
- *   'transcript' - ({ role, text }) partial/final transcript for logging
- *   'error'       - (err)
- *   'close'       - (code, reason)
+ *   'transcript'     - ({ role, text, partial }) for logging
+ *   'error'          - (err)
+ *   'close'          - (code, reason)
  */
 
 const { EventEmitter } = require('events');
 const WebSocket = require('ws');
 
 const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime';
+
+// Map the legacy shorthand ("g711_ulaw" / "g711_alaw" / "pcm16") to the GA
+// nested audio format object. Anything else is passed through unchanged so
+// operators can already supply a GA-shaped value from config if they want.
+function toGaAudioFormat(fmt) {
+  if (fmt && typeof fmt === 'object') return fmt;
+  switch (fmt) {
+    case 'g711_ulaw':
+      return { type: 'audio/pcmu' };
+    case 'g711_alaw':
+      return { type: 'audio/pcma' };
+    case 'pcm16':
+      return { type: 'audio/pcm', rate: 24000 };
+    default:
+      return { type: 'audio/pcmu' };
+  }
+}
 
 class OpenAIRealtimeClient extends EventEmitter {
   /**
@@ -53,15 +82,18 @@ class OpenAIRealtimeClient extends EventEmitter {
     }
 
     const url = `${OPENAI_REALTIME_URL}?model=${encodeURIComponent(this.config.model)}`;
-    this.logger.info('Connecting to OpenAI Realtime', { model: this.config.model });
+    this.logger.info('Connecting to OpenAI Realtime (GA)', {
+      model: this.config.model,
+    });
 
+    // GA interface: no OpenAI-Beta header. Authorization + optional
+    // safety identifier are all that's needed.
     this.ws = new WebSocket(url, {
       headers: {
         Authorization: `Bearer ${this.config.apiKey}`,
-        'OpenAI-Beta': 'realtime=v1',
       },
-      // ws will use default handshake timeout; keep small perMessageDeflate off
-      // for lowest latency on small μ-law frames.
+      // Disable per-message deflate for lowest per-frame overhead on the
+      // small (~20ms) μ-law chunks streamed from Twilio.
       perMessageDeflate: false,
     });
 
@@ -72,20 +104,38 @@ class OpenAIRealtimeClient extends EventEmitter {
   }
 
   _onOpen() {
-    this.logger.info('OpenAI Realtime socket open — sending session.update');
+    this.logger.info('OpenAI Realtime socket open — sending GA session.update');
     this.reconnectAttempts = 0;
 
+    const inputFormat = toGaAudioFormat(this.config.inputAudioFormat);
+    const outputFormat = toGaAudioFormat(this.config.outputAudioFormat);
+
+    // GA session.update shape. Keys that changed vs Beta:
+    //   - session.type: "realtime" (required)
+    //   - output_modalities (was: modalities)
+    //   - audio.input.format / audio.output.format (was: input_audio_format /
+    //     output_audio_format at top level)
+    //   - audio.input.turn_detection (was: session.turn_detection)
+    //   - audio.input.transcription (was: session.input_audio_transcription)
+    //   - audio.output.voice (was: session.voice)
     const sessionUpdate = {
       type: 'session.update',
       session: {
-        modalities: ['text', 'audio'],
+        type: 'realtime',
+        model: this.config.model,
         instructions: this.config.systemPrompt,
-        voice: this.config.voice,
-        input_audio_format: this.config.inputAudioFormat,
-        output_audio_format: this.config.outputAudioFormat,
-        input_audio_transcription: { model: 'whisper-1' },
-        turn_detection: this.config.turnDetection,
-        temperature: this.config.temperature,
+        output_modalities: ['audio'],
+        audio: {
+          input: {
+            format: inputFormat,
+            turn_detection: this.config.turnDetection,
+            transcription: { model: 'whisper-1' },
+          },
+          output: {
+            format: outputFormat,
+            voice: this.config.voice,
+          },
+        },
       },
     };
     this._send(sessionUpdate);
@@ -101,12 +151,13 @@ class OpenAIRealtimeClient extends EventEmitter {
     }
 
     switch (event.type) {
+      // GA emits session.created on connect and session.updated after our
+      // session.update. Either signals the session is ready to accept audio.
       case 'session.updated':
       case 'session.created':
         if (!this.isReady) {
           this.isReady = true;
           this.emit('open');
-          // Flush any audio buffered while the session was still initializing
           if (this.pendingAudioChunks.length) {
             this.logger.debug('Flushing buffered audio chunks', {
               count: this.pendingAudioChunks.length,
@@ -119,13 +170,15 @@ class OpenAIRealtimeClient extends EventEmitter {
         }
         break;
 
-      case 'response.audio.delta':
+      // GA audio delta events. The legacy Beta names are also matched so a
+      // partial rollback (e.g. a specific model still on Beta) keeps working.
       case 'response.output_audio.delta':
+      case 'response.audio.delta':
         if (event.delta) this.emit('audio', event.delta);
         break;
 
-      case 'response.audio.done':
       case 'response.output_audio.done':
+      case 'response.audio.done':
         this.emit('audio.done');
         break;
 
@@ -133,23 +186,36 @@ class OpenAIRealtimeClient extends EventEmitter {
         this.emit('speech.started');
         break;
 
-      case 'response.audio_transcript.delta':
+      // GA renamed the assistant transcript events.
       case 'response.output_audio_transcript.delta':
+      case 'response.audio_transcript.delta':
         if (event.delta) {
-          this.emit('transcript', { role: 'assistant', text: event.delta, partial: true });
+          this.emit('transcript', {
+            role: 'assistant',
+            text: event.delta,
+            partial: true,
+          });
         }
         break;
 
-      case 'response.audio_transcript.done':
       case 'response.output_audio_transcript.done':
+      case 'response.audio_transcript.done':
         if (event.transcript) {
-          this.emit('transcript', { role: 'assistant', text: event.transcript, partial: false });
+          this.emit('transcript', {
+            role: 'assistant',
+            text: event.transcript,
+            partial: false,
+          });
         }
         break;
 
       case 'conversation.item.input_audio_transcription.completed':
         if (event.transcript) {
-          this.emit('transcript', { role: 'user', text: event.transcript, partial: false });
+          this.emit('transcript', {
+            role: 'user',
+            text: event.transcript,
+            partial: false,
+          });
         }
         break;
 
@@ -216,12 +282,11 @@ class OpenAIRealtimeClient extends EventEmitter {
 
   /**
    * Forward a base64-encoded μ-law audio chunk from Twilio to OpenAI.
-   * If the session is not yet ready, we buffer briefly.
+   * Event name (input_audio_buffer.append) is unchanged in GA.
    */
   appendAudio(base64Ulaw) {
     if (!base64Ulaw) return;
     if (!this.isReady) {
-      // Buffer up to a reasonable amount to avoid unbounded memory use.
       if (this.pendingAudioChunks.length < 200) {
         this.pendingAudioChunks.push(base64Ulaw);
       }
@@ -231,8 +296,8 @@ class OpenAIRealtimeClient extends EventEmitter {
   }
 
   /**
-   * Cancel any in-flight response — used when the caller barges in
-   * so the assistant stops talking immediately.
+   * Cancel any in-flight response — used when the caller barges in so the
+   * assistant stops talking immediately. Event name is unchanged in GA.
    */
   cancelResponse() {
     this._send({ type: 'response.cancel' });
@@ -240,14 +305,30 @@ class OpenAIRealtimeClient extends EventEmitter {
 
   /**
    * Ask the assistant to greet proactively when the call connects.
+   *
+   * GA change: `response.modalities` was replaced with
+   * `response.output_modalities`. Everything else (conversation.item.create
+   * + response.create) is unchanged.
    */
   triggerInitialGreeting() {
     this._send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text:
+              'Greet the caller warmly as the Korwexa AI Receptionist and ask how you can help today.',
+          },
+        ],
+      },
+    });
+    this._send({
       type: 'response.create',
       response: {
-        modalities: ['audio', 'text'],
-        instructions:
-          'Greet the caller warmly as the Korwexa AI Receptionist and ask how you can help today.',
+        output_modalities: ['audio'],
       },
     });
   }
@@ -265,4 +346,4 @@ class OpenAIRealtimeClient extends EventEmitter {
   }
 }
 
-module.exports = { OpenAIRealtimeClient };
+module.exports = { OpenAIRealtimeClient, toGaAudioFormat };

@@ -40,12 +40,12 @@ const config = Object.freeze({
     apiKey: process.env.OPENAI_API_KEY || '',
     model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
     voice: process.env.OPENAI_REALTIME_VOICE || 'alloy',
-    // Twilio Media Streams uses G.711 μ-law @ 8kHz; matching this format
-    // on OpenAI's side removes the need for local audio transcoding and
-    // keeps end-to-end latency below 1s.
+    // Twilio Media Streams uses G.711 μ-law @ 8kHz. The Realtime GA
+    // schema expects a nested format object (e.g. { type: "audio/pcmu" });
+    // the shorthand strings below are auto-converted by the client so no
+    // local audio transcoding is needed and end-to-end latency stays <1s.
     inputAudioFormat: 'g711_ulaw',
     outputAudioFormat: 'g711_ulaw',
-    temperature: 0.8,
     systemPrompt: SYSTEM_PROMPT,
     turnDetection: {
       type: 'server_vad',
