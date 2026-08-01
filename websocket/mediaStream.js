@@ -33,6 +33,8 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let callSid = null;
   let closed = false;
   let markCounter = 0;
+  let finalGoodbyeDetected = false;
+  let disconnectScheduled = false;
 
   const openai = new OpenAIRealtimeClient({
     config: config.openai,
@@ -74,7 +76,13 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   });
 
   openai.on('transcript', ({ role, text, partial }) => {
-    if (!partial) logger.info('transcript', { role, text });
+    if (!partial) {
+      logger.info('transcript', { role, text });
+      if (!finalGoodbyeDetected && /thank you for calling .*have a wonderful day\. goodbye\./i.test(text)) {
+        finalGoodbyeDetected = true;
+        scheduleDisconnectIfNeeded();
+      }
+    }
   });
 
   openai.on('error', (err) => {
@@ -168,6 +176,16 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     } catch {
       /* noop */
     }
+  }
+
+  function scheduleDisconnectIfNeeded() {
+    if (disconnectScheduled || !streamSid || !finalGoodbyeDetected) return;
+    disconnectScheduled = true;
+    setTimeout(() => {
+      if (closed) return;
+      logger.info('Final goodbye detected, closing Twilio call automatically');
+      cleanup(1000, 'assistant goodbye');
+    }, 1200);
   }
 }
 
