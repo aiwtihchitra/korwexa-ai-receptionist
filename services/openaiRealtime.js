@@ -309,9 +309,7 @@ class OpenAIRealtimeClient extends EventEmitter {
    * `response.output_modalities`.
    */
   triggerInitialGreeting() {
-    const greeting =
-      this.config.greeting ||
-      'Hello! Thank you for calling. This is Sara. How may I assist you today?';
+    const greeting = this.config.greeting;
     this._send({
       type: 'conversation.item.create',
       item: {
@@ -320,7 +318,7 @@ class OpenAIRealtimeClient extends EventEmitter {
         content: [
           {
             type: 'input_text',
-            text: `Please open the call by saying exactly, in a warm natural tone: "${greeting}" Do not add anything else on this first turn.`,
+            text: `Please open the call by saying exactly, in a warm natural tone: "${greeting}". Do not add anything else on this first turn.`,
           },
         ],
       },

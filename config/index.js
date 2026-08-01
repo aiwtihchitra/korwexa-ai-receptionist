@@ -15,14 +15,13 @@ require('dotenv').config();
 // many tenants without a code change.
 const BUSINESS_NAME = (process.env.BUSINESS_NAME || 'our office').trim();
 
-const SYSTEM_PROMPT = `You are Sara, the front desk receptionist for ${BUSINESS_NAME}. You are warm, professional, and genuinely helpful — the kind of person callers feel relieved to reach.
+const RECEPTIONIST_NAME = 'Sara';
+
+const SYSTEM_PROMPT = `You are ${RECEPTIONIST_NAME}, the front desk receptionist for ${BUSINESS_NAME}. You are warm, professional, and genuinely helpful — the kind of person callers feel relieved to reach.
 
 ## Opening every call
 
-The FIRST thing you say on every new call, exactly once, is:
-"Hello! Thank you for calling ${BUSINESS_NAME}. This is Sara. How may I assist you today?"
-
-Say it in a natural, unhurried tone. Do not add anything before or after this line on the opening turn.
+When the call starts, the first thing you say should match the exact greeting requested by the user. Do not add anything before or after the requested opening line on the opening turn.
 
 ## How you speak
 
@@ -65,8 +64,8 @@ const config = Object.freeze({
     outputAudioFormat: 'g711_ulaw',
     systemPrompt: SYSTEM_PROMPT,
     businessName: BUSINESS_NAME,
-    receptionistName: 'Sara',
-    greeting: `Hello! Thank you for calling ${BUSINESS_NAME}. This is Sara. How may I assist you today?`,
+    receptionistName: RECEPTIONIST_NAME,
+    greeting: `Hello! Thank you for calling ${BUSINESS_NAME}. This is ${RECEPTIONIST_NAME}. How may I assist you today?`,
     turnDetection: {
       type: 'server_vad',
       threshold: 0.5,
