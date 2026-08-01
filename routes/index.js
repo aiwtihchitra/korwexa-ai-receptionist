@@ -16,8 +16,16 @@
  */
 
 const express = require('express');
+const { DateTime } = require('luxon');
 const { buildStreamUrl, escapeXml } = require('../utils/helpers');
-const { getAuthUrl, exchangeCode } = require('../services/googleCalendar');
+const {
+  getAuthUrl,
+  exchangeCode,
+  getAvailabilitySlots,
+  createAppointment,
+  cancelAppointment,
+} = require('../services/googleCalendar');
+const { sendConfirmationEmail } = require('../services/emailService');
 
 function createRouter({ config, logger }) {
   const router = express.Router();
@@ -29,6 +37,7 @@ function createRouter({ config, logger }) {
       version: '1.0.0',
       endpoints: {
         health: 'GET /health (also /api/health)',
+        smokeTest: 'GET /smoke-test (also /api/smoke-test)',
         twiml: 'POST /twiml (also /api/twiml)',
         mediaStream: 'WSS /media-stream (also /api/media-stream)',
         googleAuth: 'GET /auth/google (also /api/auth/google)',
@@ -111,6 +120,103 @@ function createRouter({ config, logger }) {
       logger.error('Google OAuth callback failed', { error: err.message, business });
       res.status(500).json({ error: 'Failed to complete Google OAuth callback' });
     }
+  });
+
+  router.get('/smoke-test', async (req, res) => {
+    if (config.env !== 'development' && !config.smokeTestEnabled) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    const result = {
+      googleAuth: { pass: false, error: null },
+      availability: { pass: false, error: null, slots: 0 },
+      appointment: { pass: false, error: null },
+      email: { pass: false, error: null },
+    };
+
+    const host = req.get('host');
+    const protocol = req.protocol;
+    const redirectUri = `${protocol}://${host}${req.baseUrl || ''}/auth/google/callback`;
+    const business = config.openai.businessName;
+    const now = DateTime.now().setZone(config.businessTimeZone);
+    const smokeWindowStart = now.plus({ minutes: 10 });
+    const smokeWindowEnd = smokeWindowStart.plus({ days: 1 });
+
+    let availableSlots = [];
+    try {
+      availableSlots = await getAvailabilitySlots({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+        calendarId: 'primary',
+        start: smokeWindowStart.toJSDate(),
+        end: smokeWindowEnd.toJSDate(),
+        slotMinutes: config.booking.slotMinutes,
+        dayStartHour: config.booking.dayStartHour,
+        dayEndHour: config.booking.dayEndHour,
+        timeZone: config.businessTimeZone,
+      });
+      result.googleAuth.pass = true;
+      result.availability.pass = true;
+      result.availability.slots = availableSlots.length;
+    } catch (err) {
+      const message = err?.message || 'Google Calendar request failed';
+      result.googleAuth.error = message;
+      result.availability.error = message;
+      return res.status(200).json(result);
+    }
+
+    if (!availableSlots.length) {
+      result.appointment.error = 'No available slots were found for a temporary test booking.';
+    } else {
+      const testSlot = availableSlots[0];
+      try {
+        const event = await createAppointment({
+          clientId: config.google.clientId,
+          clientSecret: config.google.clientSecret,
+          redirectUri,
+          business,
+          calendarId: 'primary',
+          summary: `Smoke Test Appointment - ${Date.now()}`,
+          description: 'Temporary smoke test event created by the secure smoke-test endpoint.',
+          start: testSlot.start,
+          end: testSlot.end,
+          guests: [],
+          timeZone: config.businessTimeZone,
+        });
+        result.appointment.pass = true;
+        await cancelAppointment({
+          clientId: config.google.clientId,
+          clientSecret: config.google.clientSecret,
+          redirectUri,
+          business,
+          calendarId: 'primary',
+          eventId: event.id,
+        });
+      } catch (err) {
+        result.appointment.error = err?.message || 'Failed to create or delete temporary appointment.';
+      }
+    }
+
+    if (!config.email.smokeRecipient) {
+      result.email.error = 'EMAIL_SMOKE_RECIPIENT environment variable is required for email test.';
+    } else {
+      try {
+        await sendConfirmationEmail({
+          to: config.email.smokeRecipient,
+          patientName: 'Smoke Test',
+          date: now.toLocaleString(DateTime.DATE_MED),
+          time: now.toLocaleString(DateTime.TIME_SIMPLE),
+          reason: 'Secure smoke test email from the Korwexa voice server.',
+        });
+        result.email.pass = true;
+      } catch (err) {
+        result.email.error = err?.message || 'Email service failed to send smoke test email.';
+      }
+    }
+
+    res.status(200).json(result);
   });
 
   return router;

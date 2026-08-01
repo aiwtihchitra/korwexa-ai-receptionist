@@ -20,11 +20,14 @@
  */
 
 const { OpenAIRealtimeClient } = require('../services/openaiRealtime');
+const { DateTime } = require('luxon');
 const {
   checkAvailability,
   createAppointment,
+  getAvailabilitySlots,
   updateAppointment,
 } = require('../services/googleCalendar');
+const { sendConfirmationEmail } = require('../services/emailService');
 const { generateConnectionId } = require('../utils/helpers');
 
 function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
@@ -39,6 +42,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let closed = false;
   let markCounter = 0;
   let finalGoodbyeDetected = false;
+  let goodbyeAudioFinished = false;
   let disconnectScheduled = false;
   let autoContinueTimer = null;
   let awaitingAutoContinue = false;
@@ -46,12 +50,13 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let availableSlots = [];
   let selectedSlot = null;
   let eventId = null;
+  let bookingConfirmed = false;
+  let bookingSummaryAnnounced = false;
   let currentAppointmentDetails = {
     name: null,
     email: null,
     phone: null,
-    date: null,
-    time: null,
+    reason: null,
   };
 
   const openai = new OpenAIRealtimeClient({
@@ -83,6 +88,15 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       streamSid,
       mark: { name: `assistant-turn-${markCounter}` },
     });
+
+    if (finalGoodbyeDetected && !disconnectScheduled) {
+      disconnectScheduled = true;
+      setTimeout(() => {
+        if (closed) return;
+        logger.info('Final goodbye audio finished, closing Twilio call');
+        cleanup(1000, 'assistant goodbye');
+      }, 1000);
+    }
   });
 
   openai.on('speech.started', () => {
@@ -98,14 +112,13 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       logger.info('transcript', { role, text });
 
       if (role === 'assistant') {
-        if (!autoContinueSent && /please give me a moment while I check/i.test(text)) {
+        if (!autoContinueSent && /please allow me a moment while I check/i.test(text)) {
           awaitingAutoContinue = true;
           scheduleAutoContinue();
         }
 
-        if (!finalGoodbyeDetected && /thank you for calling .*have a wonderful day\. goodbye\./i.test(text)) {
+        if (!finalGoodbyeDetected && /have a wonderful day\. goodbye\.|we look forward to seeing you\.?\s*goodbye\./i.test(text)) {
           finalGoodbyeDetected = true;
-          scheduleDisconnectIfNeeded();
         }
       }
 
@@ -221,47 +234,63 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   async function offerAvailableSlots() {
+    selectedSlot = null;
+    bookingSummaryAnnounced = false;
+    bookingConfirmed = false;
+    eventId = null;
+
     const redirectUri = getGoogleRedirectUri();
     const business = config.openai.businessName;
-    const candidateSlots = getCandidateSlots();
-    const available = [];
+    const now = DateTime.now().setZone(config.businessTimeZone);
+    const dayStart = now
+      .startOf('day')
+      .set({ hour: config.booking.dayStartHour, minute: 0, second: 0, millisecond: 0 });
+    const start = now > dayStart ? now : dayStart;
+    const end = dayStart
+      .plus({ days: config.booking.daysAhead })
+      .set({ hour: config.booking.dayEndHour, minute: 0, second: 0, millisecond: 0 });
 
-    for (const slot of candidateSlots) {
-      try {
-        const status = await checkAvailability({
-          clientId: config.google.clientId,
-          clientSecret: config.google.clientSecret,
-          redirectUri,
-          business,
-          calendarId: 'primary',
-          timeMin: slot.start.toISOString(),
-          timeMax: slot.end.toISOString(),
-        });
-        if (status === 'available') {
-          available.push(slot);
-        }
-      } catch (err) {
-        logger.error('Calendar availability check failed', { error: err.message, business });
-        openai.sendTextInstruction(
-          'I\'m sorry, I can\'t access the calendar right now. Please let me know the date and time you need, and I will follow up once the calendar connection is restored.'
-        );
-        return;
-      }
-    }
+    logger.info('Requesting Google Calendar availability', {
+      business,
+      start: start.toISO(),
+      end: end.toISO(),
+      timeZone: config.businessTimeZone,
+    });
 
-    availableSlots = available;
-    if (!availableSlots.length) {
-      logger.info('No available slots returned by calendar');
+    let slots;
+    try {
+      slots = await getAvailabilitySlots({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+        calendarId: 'primary',
+        start: start.toJSDate(),
+        end: end.toJSDate(),
+        slotMinutes: config.booking.slotMinutes,
+        timeZone: config.businessTimeZone,
+      });
+    } catch (err) {
+      logger.error('Google Calendar availability request failed', { error: err.message, business });
       openai.sendTextInstruction(
-        'Thank you for waiting. I checked the calendar and it looks like tomorrow is fully booked. Would another day work for you?'
+        'I\'m sorry, I can\'t access the calendar right now. Please let me know the date and time you need, and I will follow up once the calendar connection is restored.'
       );
       return;
     }
 
-    const slotText = availableSlots.map((slot) => slot.label).join(' and ');
-    const verb = availableSlots.length === 1 ? 'is' : 'are';
+    availableSlots = slots;
+    logger.info('Available slots', { availableSlots: availableSlots.map((slot) => slot.label) });
+
+    if (!availableSlots.length) {
+      openai.sendTextInstruction(
+        'Thank you for waiting. I checked the calendar and it looks like there are no available slots in the next few days. Would another day work for you?'
+      );
+      return;
+    }
+
+    const slotText = availableSlots.slice(0, 3).map((slot) => slot.label).join(' and ');
     openai.sendTextInstruction(
-      `Thank you for waiting. We have the following openings ${slotText}. Which time works best for you?`
+      `Thank you for waiting. I checked the doctor's availability, and these times are open: ${slotText}. Which time works best for you?`
     );
   }
 
@@ -306,8 +335,10 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     const normalized = text.trim();
     const name = parseName(normalized);
     const email = parseEmail(normalized);
-    const phone = parsePhone(normalized);
+    const phoneFragment = parsePhoneFragment(normalized);
+    const reason = parseReason(normalized);
     const selected = parseSelectedSlot(normalized);
+    const confirmation = parseConfirmation(normalized);
 
     if (name) {
       currentAppointmentDetails.name = name;
@@ -317,16 +348,24 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       currentAppointmentDetails.email = email;
       logger.debug('Captured email from user transcript', { email });
     }
-    if (phone) {
-      currentAppointmentDetails.phone = phone.replace(/[^\d+]/g, '');
-      logger.debug('Captured phone from user transcript', { phone: currentAppointmentDetails.phone });
+    if (phoneFragment) {
+      const cleaned = phoneFragment.replace(/[^\d]/g, '');
+      currentAppointmentDetails.phone = cleaned;
+      logger.debug('Captured phone fragment from user transcript', { phone: currentAppointmentDetails.phone });
+    }
+    if (reason) {
+      currentAppointmentDetails.reason = reason;
+      logger.debug('Captured reason for visit from user transcript', { reason });
     }
     if (selected && !selectedSlot) {
       selectedSlot = selected;
       logger.info('Caller selected an available slot', { slot: selectedSlot.label });
-      attemptCreateAppointment();
+      maybeAnnounceSummary();
     }
-
+    if (confirmation && selectedSlot && !bookingConfirmed) {
+      bookingConfirmed = true;
+      confirmAppointment();
+    }
     if (eventId) {
       updateExistingAppointment();
     }
@@ -342,9 +381,15 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     return match ? match[0].trim() : null;
   }
 
-  function parsePhone(text) {
-    const match = text.match(/(\+?\d[\d\s().-]{6,}\d)/);
+  function parsePhoneFragment(text) {
+    const match = text.match(/(\+?\d[\d\s().-]{7,}\d)/);
     return match ? match[0].trim() : null;
+  }
+
+  function parseReason(text) {
+    const match = text.match(/reason(?: for visit)? is\s+([A-Za-z0-9\s,'-]+)/i);
+    if (match) return match[1].trim();
+    return null;
   }
 
   function parseSelectedSlot(text) {
@@ -355,21 +400,29 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     return availableSlots.find((slot) => slot.label.toLowerCase().includes(normalized)) || null;
   }
 
-  async function attemptCreateAppointment() {
-    if (!selectedSlot || eventId) return;
+  function parseConfirmation(text) {
+    return /\b(yes|confirm|sure|please do|that sounds good)\b/i.test(text);
+  }
+
+  async function maybeAnnounceSummary() {
+    if (!selectedSlot || bookingSummaryAnnounced) return;
+    bookingSummaryAnnounced = true;
+
+    openai.sendTextInstruction(
+      `I have the following details: ${currentAppointmentDetails.name || 'no name yet'}, for ${selectedSlot.label}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone || 'not provided')}, email ${currentAppointmentDetails.email || 'not provided'}, and reason ${currentAppointmentDetails.reason || 'not provided'}. Shall I confirm your appointment?`
+    );
+  }
+
+  async function confirmAppointment() {
+    if (!selectedSlot || !bookingConfirmed || eventId) return;
     const redirectUri = getGoogleRedirectUri();
     const business = config.openai.businessName;
-    const summary = `${config.openai.businessName} Appointment`;
-    const description = [`Booked via voice receptionist.`];
-    if (currentAppointmentDetails.name) {
-      description.push(`Name: ${currentAppointmentDetails.name}`);
-    }
-    if (currentAppointmentDetails.phone) {
-      description.push(`Phone: ${currentAppointmentDetails.phone}`);
-    }
-    if (currentAppointmentDetails.email) {
-      description.push(`Email: ${currentAppointmentDetails.email}`);
-    }
+    const summary = `Appointment - ${currentAppointmentDetails.name || 'Patient'}`;
+    const description = [`Patient Name: ${currentAppointmentDetails.name || 'N/A'}`];
+    description.push(`Phone Number: ${currentAppointmentDetails.phone || 'N/A'}`);
+    description.push(`Email Address: ${currentAppointmentDetails.email || 'N/A'}`);
+    description.push(`Reason for Visit: ${currentAppointmentDetails.reason || 'N/A'}`);
+    description.push('Booked via Korwexa AI Receptionist');
 
     try {
       const event = await createAppointment({
@@ -383,19 +436,77 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         start: selectedSlot.start,
         end: selectedSlot.end,
         guests: currentAppointmentDetails.email ? [currentAppointmentDetails.email] : [],
+        timeZone: config.businessTimeZone,
       });
       eventId = event.id;
-      logger.info('Created calendar appointment', { eventId, slot: selectedSlot.label });
-      openai.sendTextInstruction(
-        `Your appointment has been scheduled for ${selectedSlot.label}. ` +
-          `If you have any additional details, I will add them to your booking now.`
-      );
+      logger.info('Appointment created', {
+        eventId,
+        slot: selectedSlot.label,
+        business,
+      });
+
+      if (currentAppointmentDetails.email) {
+        await sendEmailConfirmation();
+      } else {
+        const patientName = currentAppointmentDetails.name || 'Patient';
+        const date = selectedSlot.start.toLocaleDateString('en-US', {
+          timeZone: config.businessTimeZone,
+        });
+        const time = selectedSlot.start.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true,
+          timeZone: config.businessTimeZone,
+        });
+
+        logger.info('Appointment confirmed without email address', { eventId, patientName, date, time });
+        openai.sendTextInstruction(
+          `Your appointment has been confirmed for ${date} at ${time}. I do not have an email address to send confirmation to yet. If you would like a confirmation email, please provide your email address now.`
+        );
+      }
     } catch (err) {
       logger.error('Failed to create calendar appointment', { error: err.message, business });
       openai.sendTextInstruction(
         'I\'m sorry, I couldn\'t book that appointment at the moment. Can I try again or would you like a different time?'
       );
     }
+  }
+
+  async function sendEmailConfirmation() {
+    const patientName = currentAppointmentDetails.name || 'Patient';
+    const date = selectedSlot.start.toLocaleDateString('en-US', {
+      timeZone: config.businessTimeZone,
+    });
+    const time = selectedSlot.start.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZone: config.businessTimeZone,
+    });
+    const reason = currentAppointmentDetails.reason || 'N/A';
+
+    try {
+      const emailResult = await sendConfirmationEmail({
+        to: currentAppointmentDetails.email,
+        patientName,
+        date,
+        time,
+        reason,
+      });
+      logger.info('Confirmation email sent', { emailResult, eventId });
+      openai.sendTextInstruction(
+        `Your appointment has been confirmed for ${date} at ${time}. A confirmation email has been sent to ${currentAppointmentDetails.email}. We look forward to seeing you. Have a wonderful day. Goodbye.`
+      );
+    } catch (err) {
+      logger.error('Confirmation email failed', { error: err.message, eventId });
+      openai.sendTextInstruction(
+        `Your appointment has been confirmed for ${date} at ${time}. I was unable to send the confirmation email, but your booking is complete. We look forward to seeing you. Have a wonderful day. Goodbye.`
+      );
+    }
+  }
+
+  function formatPhoneForSpeech(phone) {
+    return phone.replace(/(\d)/g, '$1 ').trim();
   }
 
   async function updateExistingAppointment() {
@@ -407,17 +518,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     if (currentAppointmentDetails.email) {
       updates.attendees = [{ email: currentAppointmentDetails.email }];
     }
-    if (currentAppointmentDetails.name || currentAppointmentDetails.phone || currentAppointmentDetails.email) {
-      const description = [`Booked via voice receptionist.`];
-      if (currentAppointmentDetails.name) {
-        description.push(`Name: ${currentAppointmentDetails.name}`);
-      }
-      if (currentAppointmentDetails.phone) {
-        description.push(`Phone: ${currentAppointmentDetails.phone}`);
-      }
-      if (currentAppointmentDetails.email) {
-        description.push(`Email: ${currentAppointmentDetails.email}`);
-      }
+    if (currentAppointmentDetails.name || currentAppointmentDetails.phone || currentAppointmentDetails.email || currentAppointmentDetails.reason) {
+      const description = [`Patient Name: ${currentAppointmentDetails.name || 'N/A'}`];
+      description.push(`Phone Number: ${currentAppointmentDetails.phone || 'N/A'}`);
+      description.push(`Email Address: ${currentAppointmentDetails.email || 'N/A'}`);
+      description.push(`Reason for Visit: ${currentAppointmentDetails.reason || 'N/A'}`);
+      description.push('Booked via Korwexa AI Receptionist');
       updates.description = description.join('\n');
     }
 

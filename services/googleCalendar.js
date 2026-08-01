@@ -1,6 +1,7 @@
 'use strict';
 
 const { google } = require('googleapis');
+const { DateTime } = require('luxon');
 const { getToken, saveToken } = require('./googleTokenStore');
 
 const SCOPES = [
@@ -64,13 +65,67 @@ async function checkAvailability({ clientId, clientSecret, redirectUri, business
   return busy.length === 0 ? 'available' : 'busy';
 }
 
-async function createAppointment({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', summary, description, start, end, guests = [] }) {
+async function getAvailabilitySlots({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', start, end, slotMinutes, dayStartHour = 9, dayEndHour = 17, timeZone }) {
+  const calendar = await ensureCalendarClient({ clientId, clientSecret, redirectUri, business });
+  const startDt = start instanceof Date ? DateTime.fromJSDate(start, { zone: timeZone }) : DateTime.fromISO(start, { zone: timeZone });
+  const endDt = end instanceof Date ? DateTime.fromJSDate(end, { zone: timeZone }) : DateTime.fromISO(end, { zone: timeZone });
+  const now = DateTime.now().setZone(timeZone);
+
+  const response = await calendar.freebusy.query({
+    requestBody: {
+      timeMin: startDt.toISO(),
+      timeMax: endDt.toISO(),
+      items: [{ id: calendarId }],
+    },
+  });
+  const busy = response.data.calendars[calendarId]?.busy || [];
+
+  const slots = [];
+  let dayCursor = startDt.startOf('day');
+
+  while (dayCursor <= endDt.startOf('day')) {
+    const workStart = dayCursor.set({ hour: dayStartHour, minute: 0, second: 0, millisecond: 0 });
+    const workEnd = dayCursor.set({ hour: dayEndHour, minute: 0, second: 0, millisecond: 0 });
+    const windowStart = startDt > workStart ? startDt : workStart;
+    const windowEnd = endDt < workEnd ? endDt : workEnd;
+
+    let cursor = windowStart;
+    while (cursor.plus({ minutes: slotMinutes }) <= windowEnd) {
+      const slotEnd = cursor.plus({ minutes: slotMinutes });
+      if (slotEnd <= now) {
+        cursor = slotEnd;
+        continue;
+      }
+
+      const overlapping = busy.some((busyInterval) => {
+        const busyStart = DateTime.fromISO(busyInterval.start).setZone(timeZone);
+        const busyEnd = DateTime.fromISO(busyInterval.end).setZone(timeZone);
+        return cursor < busyEnd && slotEnd > busyStart;
+      });
+
+      if (!overlapping) {
+        const timeLabel = cursor.setLocale('en-US').toLocaleString(DateTime.TIME_SIMPLE);
+        const dateLabel = cursor.hasSame(now, 'day') ? '' : `${cursor.toLocaleString(DateTime.DATE_MED)} at `;
+        const label = `${dateLabel}${timeLabel}`.trim();
+        slots.push({ start: cursor.toJSDate(), end: slotEnd.toJSDate(), label });
+      }
+
+      cursor = slotEnd;
+    }
+
+    dayCursor = dayCursor.plus({ days: 1 });
+  }
+
+  return slots;
+}
+
+async function createAppointment({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', summary, description, start, end, guests = [], timeZone }) {
   const calendar = await ensureCalendarClient({ clientId, clientSecret, redirectUri, business });
   const event = {
     summary,
     description,
-    start: { dateTime: start.toISOString() },
-    end: { dateTime: end.toISOString() },
+    start: { dateTime: start.toISOString(), timeZone },
+    end: { dateTime: end.toISOString(), timeZone },
     attendees: guests.map((email) => ({ email })),
     reminders: {
       useDefault: true,
@@ -103,6 +158,7 @@ module.exports = {
   getAuthUrl,
   exchangeCode,
   checkAvailability,
+  getAvailabilitySlots,
   createAppointment,
   updateAppointment,
   cancelAppointment,

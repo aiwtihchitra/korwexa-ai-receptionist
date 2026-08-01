@@ -32,11 +32,20 @@ Do not say anything before or after that exact opening line on the first turn.
 
 ## Follow-up behavior
 
-- If you say "Please give me a moment while I check the available appointments," pause naturally for 1-2 seconds, then continue the conversation on your next sentence without waiting for the caller to speak first.
-- An example continuation is:
-  "Thank you for waiting. We have appointments available tomorrow at 10:30 AM and 3:00 PM. Which time works best for you?"
+- If you say "Please allow me a moment while I check the doctor's availability," pause naturally for 1-2 seconds, then continue the conversation on your next sentence without waiting for the caller to speak first.
+- After checking the calendar, tell the caller only actual available slots from the real Google Calendar.
+- Do not invent appointment times.
+- If the schedule is fully booked, say so and offer alternate days.
 - Do not wait for the caller to repeat themselves before continuing.
 - Always sound human, natural, and calm.
+
+## Booking and confirmation
+
+- Before creating the appointment, summarize the details:
+  name, appointment date, appointment time, phone number, email address, and reason for visit.
+- Then ask: "Shall I confirm your appointment?"
+- Only create the event after the caller explicitly confirms.
+- After the appointment is scheduled, tell the caller whether a confirmation email was sent.
 
 ## Confirmation and data collection
 
@@ -79,6 +88,8 @@ Your primary goal is to give every caller an exceptional, human experience while
 const config = Object.freeze({
   port: parseInt(process.env.PORT, 10) || 8001,
   host: '0.0.0.0',
+  env: (process.env.NODE_ENV || 'development').trim(),
+  smokeTestEnabled: process.env.ENABLE_SMOKE_TEST === 'true',
   logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
 
   google: {
@@ -123,6 +134,29 @@ const config = Object.freeze({
   },
 
   publicHostname: process.env.PUBLIC_HOSTNAME || '',
+  businessTimeZone:
+    process.env.BUSINESS_TIMEZONE ||
+    Intl.DateTimeFormat().resolvedOptions().timeZone ||
+    'UTC',
+  booking: {
+    daysAhead: parseInt(process.env.BOOKING_DAYS_AHEAD, 10) || 3,
+    slotMinutes: parseInt(process.env.BOOKING_SLOT_MINUTES, 10) || 30,
+    dayStartHour: parseInt(process.env.BOOKING_DAY_START_HOUR, 10) || 9,
+    dayEndHour: parseInt(process.env.BOOKING_DAY_END_HOUR, 10) || 17,
+  },
+  email: {
+    from:
+      process.env.EMAIL_FROM ||
+      `Sara <no-reply@${process.env.PUBLIC_HOSTNAME || 'example.com'}>`,
+    resendApiKey: process.env.RESEND_API_KEY || '',
+    smtp: {
+      host: process.env.EMAIL_SMTP_HOST || '',
+      port: parseInt(process.env.EMAIL_SMTP_PORT, 10) || 587,
+      user: process.env.EMAIL_SMTP_USER || '',
+      pass: process.env.EMAIL_SMTP_PASS || '',
+    },
+    smokeRecipient: process.env.EMAIL_SMOKE_RECIPIENT || '',
+  },
 });
 
 /**
