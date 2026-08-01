@@ -301,11 +301,17 @@ class OpenAIRealtimeClient extends EventEmitter {
   /**
    * Ask the assistant to greet proactively when the call connects.
    *
+   * Sends an explicit greeting string derived from config (business name is
+   * injected server-side so a single deployment can serve many tenants).
+   * Sara reads it aloud verbatim as the first spoken line of the call.
+   *
    * GA change: `response.modalities` was replaced with
-   * `response.output_modalities`. Everything else (conversation.item.create
-   * + response.create) is unchanged.
+   * `response.output_modalities`.
    */
   triggerInitialGreeting() {
+    const greeting =
+      this.config.greeting ||
+      'Hello! Thank you for calling. This is Sara. How may I assist you today?';
     this._send({
       type: 'conversation.item.create',
       item: {
@@ -314,8 +320,7 @@ class OpenAIRealtimeClient extends EventEmitter {
         content: [
           {
             type: 'input_text',
-            text:
-              'Greet the caller warmly as the Korwexa AI Receptionist and ask how you can help today.',
+            text: `Please open the call by saying exactly, in a warm natural tone: "${greeting}" Do not add anything else on this first turn.`,
           },
         ],
       },
