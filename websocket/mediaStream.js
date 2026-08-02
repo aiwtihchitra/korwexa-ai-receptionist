@@ -40,6 +40,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let appointmentDetailsCollected = false;
   let bookingFlowStarted = false;
   let bookingCompleted = false;
+  const pendingAssistantInstructions = [];
   let lastStructuredSyncAt = null;
   let lastStructuredSyncCallId = null;
   let lastStructuredSyncPayload = null;
@@ -92,6 +93,11 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     });
 
     scheduleDisconnectIfNeeded();
+    flushQueuedAssistantInstructions('audio.done');
+  });
+
+  openai.on('response.done', () => {
+    flushQueuedAssistantInstructions('response.done');
   });
 
   openai.on('transcript', ({ role, text, partial }) => {
@@ -136,7 +142,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         ok: true,
         appliedFields,
         bookingState: { ...currentAppointmentDetails },
-      });
+      }, { createResponse: false });
     }
   });
 
@@ -384,8 +390,22 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   async function maybeStartBookingFlow() {
+    logger.info('BOOKING_EXECUTION_ENTER', {
+      bookingCompleted,
+      bookingFlowStarted,
+      hasRequiredBookingInfo: hasRequiredBookingInfo(),
+      bookingConfirmed,
+      missingFields: getMissingBookingFields(),
+      activeOpenAIResponse: openai.hasActiveResponse,
+    });
+
     if (bookingCompleted || bookingFlowStarted) return;
     if (!hasRequiredBookingInfo() || !bookingConfirmed) return;
+
+    logger.info('BOOKING_EXECUTION_PRE_START', {
+      bookingState: { ...currentAppointmentDetails },
+      activeOpenAIResponse: openai.hasActiveResponse,
+    });
 
     bookingFlowStarted = true;
     logger.info('BOOKING_STARTED', {
@@ -395,6 +415,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       appointmentDate: currentAppointmentDetails.appointmentDate,
       appointmentTime: currentAppointmentDetails.appointmentTime,
       reason: currentAppointmentDetails.reason,
+    });
+
+    logger.info('BOOKING_EXECUTION_PRE_WEBHOOK', {
+      webhookUrl: bookingWebhookUrl,
+      bookingState: { ...currentAppointmentDetails },
+      activeOpenAIResponse: openai.hasActiveResponse,
     });
 
     await submitBookingWebhook();
@@ -444,6 +470,11 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
     bookingConfirmed = true;
     logger.info('Booking details confirmed by caller');
+    logger.info('BOOKING_CONFIRMATION_EXECUTION_READY', {
+      bookingState: { ...currentAppointmentDetails },
+      missingFields: getMissingBookingFields(),
+      activeOpenAIResponse: openai.hasActiveResponse,
+    });
     await maybeStartBookingFlow();
   }
 
@@ -451,8 +482,10 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     if (!hasRequiredBookingInfo() || bookingSummaryAnnounced) return;
     bookingSummaryAnnounced = true;
 
-    openai.sendTextInstruction(
+    sendOrQueueAssistantInstruction(
       `I have the following details: ${currentAppointmentDetails.name}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone)}, email ${currentAppointmentDetails.email}, appointment date ${currentAppointmentDetails.appointmentDate}, appointment time ${currentAppointmentDetails.appointmentTime}, and reason ${currentAppointmentDetails.reason}. Shall I confirm your appointment?`
+      ,
+      'booking_summary'
     );
   }
 
@@ -499,19 +532,61 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
       bookingCompleted = true;
       logger.info('BOOKING_COMPLETED', { responseStatus: response.status });
+      logger.info('BOOKING_EXECUTION_AFTER_WEBHOOK', {
+        responseStatus: response.status,
+        bookingState: { ...currentAppointmentDetails },
+      });
       logger.info('Goodbye initiated', { reason: 'booking completed via webhook' });
-      openai.sendTextInstruction(
-        'Your appointment has been confirmed. You\'ll receive your confirmation shortly.'
+      sendOrQueueAssistantInstruction(
+        'Your appointment has been confirmed. You\'ll receive your confirmation shortly.',
+        'booking_success'
       );
     } catch (err) {
       bookingFlowStarted = false;
       bookingConfirmed = false;
       logger.error(`Webhook error: ${err.message}`);
       logger.error('BOOKING_WEBHOOK_FAILED', { error: err.message });
-      openai.sendTextInstruction(
+      sendOrQueueAssistantInstruction(
         `I\'m sorry, I couldn\'t confirm the appointment just now. ${err.message}. Please try again in a moment.`
+        ,
+        'booking_error'
       );
     }
+  }
+
+  function sendOrQueueAssistantInstruction(text, reason) {
+    if (!text) return;
+
+    logger.info('BOOKING_EXECUTION_PRE_RESPONSE_CREATE', {
+      reason,
+      activeOpenAIResponse: openai.hasActiveResponse,
+      queueDepth: pendingAssistantInstructions.length,
+    });
+
+    if (openai.hasActiveResponse) {
+      pendingAssistantInstructions.push({ text, reason });
+      logger.warn('Assistant response active; deferring speech instruction', {
+        reason,
+        queueDepth: pendingAssistantInstructions.length,
+      });
+      return;
+    }
+
+    openai.sendTextInstruction(text, { createResponse: true });
+    logger.info('Assistant instruction sent', { reason });
+  }
+
+  function flushQueuedAssistantInstructions(trigger) {
+    if (openai.hasActiveResponse) return;
+    if (!pendingAssistantInstructions.length) return;
+
+    const next = pendingAssistantInstructions.shift();
+    logger.info('Flushing deferred assistant instruction', {
+      trigger,
+      reason: next.reason,
+      remainingQueueDepth: pendingAssistantInstructions.length,
+    });
+    openai.sendTextInstruction(next.text, { createResponse: true });
   }
 
   function formatPhoneForSpeech(phone) {

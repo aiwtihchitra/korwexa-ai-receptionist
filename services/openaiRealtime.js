@@ -87,6 +87,7 @@ class OpenAIRealtimeClient extends EventEmitter {
     this.logger = logger;
     this.ws = null;
     this.isReady = false;
+    this.hasActiveResponse = false;
     this.isClosed = false;
     this.reconnectAttempts = 0;
     this.pendingAudioChunks = [];
@@ -197,6 +198,16 @@ class OpenAIRealtimeClient extends EventEmitter {
 
       case 'response.output_audio.done':
         this.emit('audio.done');
+        break;
+
+      case 'response.created':
+        this.hasActiveResponse = true;
+        this.emit('response.created', event.response || null);
+        break;
+
+      case 'response.done':
+        this.hasActiveResponse = false;
+        this.emit('response.done', event.response || null);
         break;
 
       case 'input_audio_buffer.speech_started':
@@ -383,16 +394,19 @@ class OpenAIRealtimeClient extends EventEmitter {
         ],
       },
     });
-    this._send({
+    const created = this._send({
       type: 'response.create',
       response: {
         output_modalities: ['audio'],
       },
     });
+    if (created) this.hasActiveResponse = true;
   }
 
-  sendTextInstruction(text) {
+  sendTextInstruction(text, options = {}) {
     if (!text) return false;
+    const { createResponse = true } = options;
+
     this._send({
       type: 'conversation.item.create',
       item: {
@@ -406,17 +420,23 @@ class OpenAIRealtimeClient extends EventEmitter {
         ],
       },
     });
-    this._send({
-      type: 'response.create',
-      response: {
-        output_modalities: ['audio'],
-      },
-    });
+
+    if (createResponse) {
+      const created = this._send({
+        type: 'response.create',
+        response: {
+          output_modalities: ['audio'],
+        },
+      });
+      if (created) this.hasActiveResponse = true;
+    }
+
     return true;
   }
 
-  submitToolResult(callId, output) {
+  submitToolResult(callId, output, options = {}) {
     if (!callId) return false;
+    const { createResponse = false } = options;
     const outputText = typeof output === 'string' ? output : JSON.stringify(output || {});
     const created = this._send({
       type: 'conversation.item.create',
@@ -429,12 +449,16 @@ class OpenAIRealtimeClient extends EventEmitter {
 
     if (!created) return false;
 
-    this._send({
-      type: 'response.create',
-      response: {
-        output_modalities: ['audio'],
-      },
-    });
+    if (createResponse) {
+      const createdResponse = this._send({
+        type: 'response.create',
+        response: {
+          output_modalities: ['audio'],
+        },
+      });
+      if (createdResponse) this.hasActiveResponse = true;
+    }
+
     return true;
   }
 
