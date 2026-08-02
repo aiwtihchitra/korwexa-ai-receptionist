@@ -260,11 +260,19 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       maybeAnnounceSummary();
     }
 
-    if (confirmation && hasRequiredBookingInfo() && !bookingConfirmed) {
-      bookingConfirmed = true;
-      logger.info('Booking details confirmed by caller');
-      maybeStartBookingFlow();
-    }
+    logger.info('BOOKING_CONFIRMATION_CHECKPOINT', {
+      transcript: normalized,
+      confirmationDetected: confirmation,
+      hasRequiredBookingInfo: hasRequiredBookingInfo(),
+      bookingConfirmed,
+      bookingFlowStarted,
+      bookingCompleted,
+      missingFields: getMissingBookingFields(),
+    });
+
+    handleBookingConfirmation({ confirmation, transcript: normalized }).catch((err) =>
+      logger.error('handleBookingConfirmation failed', { error: err.message })
+    );
 
     // Re-check booking flow after processing the latest transcript
     maybeStartBookingFlow().catch((err) => logger.error('maybeStartBookingFlow failed', { error: err.message }));
@@ -355,6 +363,31 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     await submitBookingWebhook();
   }
 
+  async function handleBookingConfirmation({ confirmation, transcript }) {
+    logger.info('Entering booking confirmation handler', {
+      transcript,
+      confirmationDetected: confirmation,
+      hasRequiredBookingInfo: hasRequiredBookingInfo(),
+      bookingConfirmed,
+      missingFields: getMissingBookingFields(),
+    });
+
+    if (!confirmation) return;
+
+    if (!hasRequiredBookingInfo()) {
+      logger.warn('Confirmation received but required booking info is missing', {
+        missingFields: getMissingBookingFields(),
+      });
+      return;
+    }
+
+    if (bookingConfirmed) return;
+
+    bookingConfirmed = true;
+    logger.info('Booking details confirmed by caller');
+    await maybeStartBookingFlow();
+  }
+
   function maybeAnnounceSummary() {
     if (!hasRequiredBookingInfo() || bookingSummaryAnnounced) return;
     bookingSummaryAnnounced = true;
@@ -378,6 +411,10 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
     try {
       logger.info(`Calling n8n booking webhook: ${bookingWebhookUrl}`);
+      logger.info('BOOKING_WEBHOOK_PRE_POST', {
+        url: bookingWebhookUrl,
+        payload,
+      });
       const response = await fetch(bookingWebhookUrl, {
         method: 'POST',
         headers: {
@@ -428,6 +465,17 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     if (typeof responseBody.error === 'string' && responseBody.error.trim()) return responseBody.error.trim();
     if (typeof responseBody.message === 'string' && responseBody.message.trim()) return responseBody.message.trim();
     return null;
+  }
+
+  function getMissingBookingFields() {
+    const missing = [];
+    if (!currentAppointmentDetails.name) missing.push('name');
+    if (!currentAppointmentDetails.phone) missing.push('phone');
+    if (!currentAppointmentDetails.email) missing.push('email');
+    if (!currentAppointmentDetails.appointmentDate) missing.push('appointmentDate');
+    if (!currentAppointmentDetails.appointmentTime) missing.push('appointmentTime');
+    if (!currentAppointmentDetails.reason) missing.push('reason');
+    return missing;
   }
 
   function scheduleDisconnectIfNeeded() {
