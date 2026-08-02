@@ -241,6 +241,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     const appointmentDate = parseAppointmentDate(normalized);
     const appointmentTime = parseAppointmentTime(normalized);
     const confirmation = parseConfirmation(normalized);
+    logger.info('BOOKING_CONFIRMATION_PARSE_INPUT', {
+      transcriptRaw: text,
+      transcriptNormalized: normalized,
+      confirmationDetected: confirmation,
+      parser: 'parseConfirmation',
+    });
     let detailsUpdated = false;
 
     if (name) {
@@ -400,7 +406,15 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     });
 
     if (bookingCompleted || bookingFlowStarted) return;
-    if (!hasRequiredBookingInfo() || !bookingConfirmed) return;
+    if (!hasRequiredBookingInfo()) return;
+
+    logger.info('BOOKING_EXECUTION_PRE_CONFIRMATION_GUARD', {
+      bookingConfirmed,
+      hasRequiredBookingInfo: hasRequiredBookingInfo(),
+      bookingFlowStarted,
+      bookingCompleted,
+    });
+    if (!bookingConfirmed) return;
 
     logger.info('BOOKING_EXECUTION_PRE_START', {
       bookingState: { ...currentAppointmentDetails },
@@ -468,7 +482,16 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
     if (bookingConfirmed) return;
 
+    logger.info('BOOKING_CONFIRMATION_SET_ATTEMPT', {
+      beforeBookingConfirmed: bookingConfirmed,
+      confirmation,
+      transcript,
+    });
     bookingConfirmed = true;
+    logger.info('BOOKING_CONFIRMATION_SET_RESULT', {
+      afterBookingConfirmed: bookingConfirmed,
+      transcript,
+    });
     logger.info('Booking details confirmed by caller');
     logger.info('BOOKING_CONFIRMATION_EXECUTION_READY', {
       bookingState: { ...currentAppointmentDetails },
