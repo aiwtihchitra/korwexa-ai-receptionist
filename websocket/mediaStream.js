@@ -20,14 +20,6 @@
  */
 
 const { OpenAIRealtimeClient } = require('../services/openaiRealtime');
-const { DateTime } = require('luxon');
-const {
-  checkAvailability,
-  createAppointment,
-  getAvailabilitySlots,
-  updateAppointment,
-} = require('../services/googleCalendar');
-const { sendConfirmationEmail } = require('../services/emailService');
 const { generateConnectionId } = require('../utils/helpers');
 
 function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
@@ -43,21 +35,18 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let markCounter = 0;
   let finalGoodbyeDetected = false;
   let disconnectScheduled = false;
-  let autoContinueTimer = null;
-  let awaitingAutoContinue = false;
-  let autoContinueSent = false;
-  let availableSlots = [];
-  let selectedSlot = null;
-  let eventId = null;
   let bookingConfirmed = false;
   let bookingSummaryAnnounced = false;
   let appointmentDetailsCollected = false;
   let bookingFlowStarted = false;
   let bookingCompleted = false;
+  const bookingWebhookUrl = 'https://aiwithchitra.app.n8n.cloud/webhook/sara-booking';
   let currentAppointmentDetails = {
     name: null,
     email: null,
     phone: null,
+    appointmentDate: null,
+    appointmentTime: null,
     reason: null,
   };
 
@@ -99,11 +88,6 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       logger.info('transcript', { role, text });
 
       if (role === 'assistant') {
-        if (!autoContinueSent && /please allow me a moment while I check/i.test(text)) {
-          awaitingAutoContinue = true;
-          scheduleAutoContinue();
-        }
-
         if (!finalGoodbyeDetected && /thank you for choosing our clinic[\s,\.]*we look forward to seeing you[\s,\.]*have a wonderful day[\s,\.]*goodbye/i.test(text)) {
           if (bookingCompleted) {
             finalGoodbyeDetected = true;
@@ -213,184 +197,73 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     }
   }
 
-  function scheduleAutoContinue() {
-    if (autoContinueTimer || !awaitingAutoContinue || autoContinueSent) return;
-    autoContinueTimer = setTimeout(async () => {
-      autoContinueTimer = null;
-      if (closed || !streamSid || !awaitingAutoContinue) return;
-      awaitingAutoContinue = false;
-      autoContinueSent = true;
-      logger.info('Auto-continuing after moment pause');
-      await offerAvailableSlots();
-    }, 1500);
-  }
-
-  async function offerAvailableSlots() {
-    selectedSlot = null;
-    bookingSummaryAnnounced = false;
-    bookingConfirmed = false;
-    eventId = null;
-
-    const redirectUri = getGoogleRedirectUri();
-    const business = config.openai.businessName;
-    const now = DateTime.now().setZone(config.businessTimeZone);
-    const dayStart = now
-      .startOf('day')
-      .set({ hour: config.booking.dayStartHour, minute: 0, second: 0, millisecond: 0 });
-    const start = now > dayStart ? now : dayStart;
-    const end = dayStart
-      .plus({ days: config.booking.daysAhead })
-      .set({ hour: config.booking.dayEndHour, minute: 0, second: 0, millisecond: 0 });
-
-    logger.info('Booking function entered', { function: 'offerAvailableSlots' });
-    logger.info('Business identified', { business });
-    logger.info('BOOKING_STARTED', { business, name: currentAppointmentDetails.name, email: currentAppointmentDetails.email, phone: currentAppointmentDetails.phone });
-    logger.info('CALENDAR_CHECK_STARTED', {
-      business,
-      start: start.toISO(),
-      end: end.toISO(),
-      timeZone: config.businessTimeZone,
-    });
-
-    let slots;
-    try {
-      slots = await getAvailabilitySlots({
-        clientId: config.google.clientId,
-        clientSecret: config.google.clientSecret,
-        redirectUri,
-        business,
-        calendarId: 'primary',
-        start: start.toJSDate(),
-        end: end.toJSDate(),
-        slotMinutes: config.booking.slotMinutes,
-        timeZone: config.businessTimeZone,
-        logger,
-      });
-      logger.info('Google Calendar API response received', {
-        business,
-        requestedStart: start.toISO(),
-        requestedEnd: end.toISO(),
-        slotCount: slots.length,
-      });
-      logger.info('CALENDAR_AVAILABLE', { business, slotCount: slots.length });
-    } catch (err) {
-      logger.error('Google Calendar availability request failed', { error: err.message, business });
-      openai.sendTextInstruction(
-        'I\'m sorry, I am having trouble checking the calendar right now. Can I try again in a moment or would you like a different time?'
-      );
-      return;
-    }
-
-    availableSlots = slots;
-    logger.info('Available slots', { availableSlots: availableSlots.map((slot) => slot.label) });
-
-    if (!availableSlots.length) {
-      logger.warn('No available slots were found after calendar check', {
-        business,
-        start: start.toISO(),
-        end: end.toISO(),
-      });
-      openai.sendTextInstruction(
-        'Thank you for waiting. I checked the calendar and it looks like there are no available slots in the next few days. Would another day work for you?'
-      );
-      return;
-    }
-
-    const slotText = availableSlots.slice(0, 3).map((slot) => slot.label).join(' and ');
-    openai.sendTextInstruction(
-      `Thank you for waiting. I checked the doctor's availability, and these times are open: ${slotText}. Which time works best for you?`
-    );
-  }
-
-  function getCandidateSlots() {
-    const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setDate(now.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
-
-    const buildSlot = (hour, minute) => {
-      const start = new Date(tomorrow);
-      start.setHours(hour, minute, 0, 0);
-      const end = new Date(start.getTime() + 30 * 60 * 1000);
-      return {
-        label: start.toLocaleTimeString('en-US', {
-          hour: 'numeric',
-          minute: '2-digit',
-          hour12: true,
-        }).replace(/\u202F/g, ' '),
-        start,
-        end,
-      };
-    };
-
-    return [buildSlot(10, 30), buildSlot(15, 0)];
-  }
-
-  function getGoogleRedirectUri() {
-    const basePath = getRequestBasePath();
-    if (config.publicHostname && config.publicHostname.trim()) {
-      return `https://${config.publicHostname}${basePath}/auth/google/callback`;
-    }
-    return `http://localhost:${config.port}${basePath}/auth/google/callback`;
-  }
-
-  function getRequestBasePath() {
-    const path = (req.url || '').split('?')[0];
-    return path.startsWith('/api/') ? '/api' : '';
-  }
-
   function handleUserTranscript(text) {
     const normalized = text.trim();
     const name = parseName(normalized);
     const email = parseEmail(normalized);
     const phoneFragment = parsePhoneFragment(normalized);
     const reason = parseReason(normalized);
-    const selected = parseSelectedSlot(normalized) || parseRequestedSlot(normalized);
+    const appointmentDate = parseAppointmentDate(normalized);
+    const appointmentTime = parseAppointmentTime(normalized);
     const confirmation = parseConfirmation(normalized);
+    let detailsUpdated = false;
 
     if (name) {
       currentAppointmentDetails.name = name;
+      detailsUpdated = true;
       logger.debug('Captured name from user transcript', { name });
     }
     if (email) {
       currentAppointmentDetails.email = email;
+      detailsUpdated = true;
       logger.debug('Captured email from user transcript', { email });
     }
     if (phoneFragment) {
       const cleaned = phoneFragment.replace(/[^\d]/g, '');
       currentAppointmentDetails.phone = cleaned;
+      detailsUpdated = true;
       logger.debug('Captured phone fragment from user transcript', { phone: currentAppointmentDetails.phone });
+    }
+    if (appointmentDate) {
+      currentAppointmentDetails.appointmentDate = appointmentDate;
+      detailsUpdated = true;
+      logger.debug('Captured appointment date from user transcript', { appointmentDate });
+    }
+    if (appointmentTime) {
+      currentAppointmentDetails.appointmentTime = appointmentTime;
+      detailsUpdated = true;
+      logger.debug('Captured appointment time from user transcript', { appointmentTime });
     }
     if (reason) {
       currentAppointmentDetails.reason = reason;
+      detailsUpdated = true;
       logger.debug('Captured reason for visit from user transcript', { reason });
     }
-    if (!appointmentDetailsCollected && currentAppointmentDetails.name && currentAppointmentDetails.email && currentAppointmentDetails.phone) {
+
+    if (detailsUpdated) {
+      bookingSummaryAnnounced = false;
+    }
+
+    if (!appointmentDetailsCollected && hasRequiredBookingInfo()) {
       appointmentDetailsCollected = true;
       logger.info('Appointment details collected', {
         name: currentAppointmentDetails.name,
         email: currentAppointmentDetails.email,
         phone: currentAppointmentDetails.phone,
+        appointmentDate: currentAppointmentDetails.appointmentDate,
+        appointmentTime: currentAppointmentDetails.appointmentTime,
         reason: currentAppointmentDetails.reason || 'not provided',
       });
-      maybeStartBookingFlow();
     }
-    if (selected) {
-      if (!selectedSlot || selectedSlot.label !== selected.label) {
-        selectedSlot = selected;
-        bookingSummaryAnnounced = false;
-        bookingConfirmed = false;
-        logger.info('Caller selected an available slot', { slot: selectedSlot.label });
-        maybeAnnounceSummary();
-        maybeStartBookingFlow();
-      }
+
+    if (hasRequiredBookingInfo()) {
+      maybeAnnounceSummary();
     }
-    if (confirmation && selectedSlot && !bookingConfirmed) {
+
+    if (confirmation && hasRequiredBookingInfo() && !bookingConfirmed) {
       bookingConfirmed = true;
-      confirmAppointment();
-    }
-    if (eventId) {
-      updateExistingAppointment();
+      logger.info('Booking details confirmed by caller');
+      maybeStartBookingFlow();
     }
 
     // Re-check booking flow after processing the latest transcript
@@ -420,47 +293,26 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     return match ? match[1].trim() : null;
   }
 
-  function parseSelectedSlot(text) {
-    if (!availableSlots.length) return null;
-    const match = text.match(/(\d{1,2}(?::\d{2})?)\s*(am|pm)/i);
-    if (!match) return null;
-    const normalized = match[0].toLowerCase();
-    return availableSlots.find((slot) => slot.label.toLowerCase().includes(normalized)) || null;
+  function parseAppointmentDate(text) {
+    const directIso = text.match(/\b(\d{4}-\d{2}-\d{2})\b/i);
+    if (directIso) return directIso[1];
+
+    const slashDate = text.match(/\b(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/i);
+    if (slashDate) return slashDate[1];
+
+    const relativeDate = text.match(/\b(today|tomorrow|day after tomorrow)\b/i);
+    if (relativeDate) return relativeDate[1].toLowerCase();
+
+    const monthDate = text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{2,4})?\b/i);
+    if (monthDate) return monthDate[0].trim();
+
+    return null;
   }
 
-  function parseRequestedSlot(text) {
-    const timeMatch = text.match(/(\d{1,2}(?::\d{2})?)\s*(am|pm)/i);
-    if (!timeMatch) return null;
-
-    const dateMatch = text.match(/\b(today|tomorrow|day after tomorrow|next\s+\w+|\w+\s+\d{1,2}(?:st|nd|rd|th)?|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/i);
-    const timeText = timeMatch[0];
-    let dateTime;
-
-    if (dateMatch) {
-      const dateText = dateMatch[0];
-      const parsed = DateTime.fromFormat(`${dateText} ${timeText}`, 'MMMM d yyyy h:mm a', { zone: config.businessTimeZone });
-      if (parsed.isValid) {
-        dateTime = parsed;
-      }
-    }
-
-    if (!dateTime) {
-      const today = DateTime.now().setZone(config.businessTimeZone);
-      const timeParsed = DateTime.fromFormat(timeText, 'h:mm a', { zone: config.businessTimeZone });
-      if (timeParsed.isValid) {
-        dateTime = today.set({ hour: timeParsed.hour, minute: timeParsed.minute, second: 0, millisecond: 0 });
-        if (dateTime < today) {
-          dateTime = dateTime.plus({ days: 1 });
-        }
-      }
-    }
-
-    if (!dateTime || !dateTime.isValid) return null;
-
-    const start = dateTime.toJSDate();
-    const end = dateTime.plus({ minutes: config.booking.slotMinutes }).toJSDate();
-    const label = dateTime.setLocale('en-US').toLocaleString(DateTime.DATETIME_MED);
-    return { label, start, end };
+  function parseAppointmentTime(text) {
+    const timeMatch = text.match(/\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+    if (timeMatch) return timeMatch[1].replace(/\s+/g, ' ').trim().toLowerCase();
+    return null;
   }
 
   function parseConfirmation(text) {
@@ -476,230 +328,89 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function hasRequiredBookingInfo() {
-    return hasCustomerContactDetails() && Boolean(selectedSlot);
-  }
-
-  async function maybeStartBookingFlow() {
-    if (bookingCompleted) return;
-
-    if (hasRequiredBookingInfo()) {
-      if (!bookingFlowStarted) {
-        bookingFlowStarted = true;
-        logger.info('BOOKING_STARTED', {
-          name: currentAppointmentDetails.name,
-          email: currentAppointmentDetails.email,
-          phone: currentAppointmentDetails.phone,
-          slot: selectedSlot.label,
-        });
-      }
-      bookingConfirmed = true;
-      await confirmAppointment();
-      return;
-    }
-
-    if (hasCustomerContactDetails() && !selectedSlot && !availableSlots.length && !bookingFlowStarted) {
-      bookingFlowStarted = true;
-      logger.info('BOOKING_STARTED', {
-        name: currentAppointmentDetails.name,
-        email: currentAppointmentDetails.email,
-        phone: currentAppointmentDetails.phone,
-      });
-      await offerAvailableSlots();
-    }
-  }
-
-  async function maybeAnnounceSummary() {
-    if (!selectedSlot || bookingSummaryAnnounced) return;
-    bookingSummaryAnnounced = true;
-
-    const missingFields = [];
-    if (!currentAppointmentDetails.name) missingFields.push('your full name');
-    if (!currentAppointmentDetails.phone) missingFields.push('your phone number');
-    if (!currentAppointmentDetails.email) missingFields.push('your email address');
-
-    if (missingFields.length) {
-      openai.sendTextInstruction(
-        `I have your appointment time as ${selectedSlot.label}. Could you please provide ${missingFields.join(' and ')}?`
-      );
-      return;
-    }
-
-    openai.sendTextInstruction(
-      `I have the following details: ${currentAppointmentDetails.name}, for ${selectedSlot.label}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone)}, email ${currentAppointmentDetails.email}, and reason ${currentAppointmentDetails.reason || 'not provided'}. Shall I confirm your appointment?`
+    return Boolean(
+      currentAppointmentDetails.name &&
+      currentAppointmentDetails.phone &&
+      currentAppointmentDetails.email &&
+      currentAppointmentDetails.appointmentDate &&
+      currentAppointmentDetails.appointmentTime &&
+      currentAppointmentDetails.reason
     );
   }
 
-  async function confirmAppointment() {
-    if (!selectedSlot) {
-      logger.warn('confirmAppointment exited early', { reason: 'no selected slot' });
-      return;
-    }
-    if (!bookingConfirmed) {
-      logger.warn('confirmAppointment exited early', { reason: 'booking not confirmed' });
-      return;
-    }
-    if (eventId) {
-      logger.warn('confirmAppointment exited early', { reason: 'appointment already created', eventId });
-      return;
-    }
+  async function maybeStartBookingFlow() {
+    if (bookingCompleted || bookingFlowStarted) return;
+    if (!hasRequiredBookingInfo() || !bookingConfirmed) return;
 
-    logger.info('Booking function entered', { function: 'confirmAppointment', slot: selectedSlot.label });
+    bookingFlowStarted = true;
+    logger.info('BOOKING_STARTED', {
+      name: currentAppointmentDetails.name,
+      email: currentAppointmentDetails.email,
+      phone: currentAppointmentDetails.phone,
+      appointmentDate: currentAppointmentDetails.appointmentDate,
+      appointmentTime: currentAppointmentDetails.appointmentTime,
+      reason: currentAppointmentDetails.reason,
+    });
 
-    const missingFields = [];
-    if (!currentAppointmentDetails.name) missingFields.push('name');
-    if (!currentAppointmentDetails.phone) missingFields.push('phone number');
-    if (!currentAppointmentDetails.email) missingFields.push('email address');
-
-    if (missingFields.length) {
-      bookingConfirmed = false;
-      logger.warn('confirmAppointment missing required appointment details', { missingFields });
-      openai.sendTextInstruction(
-        `Before I book the appointment, I need ${missingFields.join(' and ')}. Could you provide that information?`
-      );
-      return;
-    }
-
-    const redirectUri = getGoogleRedirectUri();
-    const business = config.openai.businessName;
-
-    try {
-      logger.info('CALENDAR_CHECK_STARTED', {
-        business,
-        slot: selectedSlot.label,
-        timeMin: selectedSlot.start.toISOString(),
-        timeMax: selectedSlot.end.toISOString(),
-      });
-      const slotStatus = await checkAvailability({
-        clientId: config.google.clientId,
-        clientSecret: config.google.clientSecret,
-        redirectUri,
-        business,
-        calendarId: 'primary',
-        timeMin: selectedSlot.start.toISOString(),
-        timeMax: selectedSlot.end.toISOString(),
-        logger,
-      });
-
-      logger.info('Checking selected slot availability', {
-        business,
-        slot: selectedSlot.label,
-        status: slotStatus,
-      });
-      logger.info('Google Calendar availability response received', {
-        business,
-        slot: selectedSlot.label,
-        status: slotStatus,
-      });
-      if (slotStatus === 'available') {
-        logger.info('CALENDAR_AVAILABLE', { business, slot: selectedSlot.label });
-      }
-
-      if (slotStatus === 'busy') {
-        logger.warn('Selected slot is no longer available', { slot: selectedSlot.label, business });
-        await offerNextAvailableSlots('selected slot busy');
-        return;
-      }
-    } catch (err) {
-      logger.error('Failed to verify slot availability', { error: err.message, business });
-      openai.sendTextInstruction('I am having trouble checking that time with the calendar right now. Can I try a different time?');
-      return;
-    }
-
-    const summary = `Appointment - ${currentAppointmentDetails.name || 'Patient'}`;
-    const description = [`Patient Name: ${currentAppointmentDetails.name || 'N/A'}`];
-    description.push(`Phone Number: ${currentAppointmentDetails.phone || 'N/A'}`);
-    description.push(`Email Address: ${currentAppointmentDetails.email || 'N/A'}`);
-    description.push(`Reason for Visit: ${currentAppointmentDetails.reason || 'N/A'}`);
-    description.push('Booked via Korwexa AI Receptionist');
-
-    try {
-      const event = await createAppointment({
-        clientId: config.google.clientId,
-        clientSecret: config.google.clientSecret,
-        redirectUri,
-        business,
-        calendarId: 'primary',
-        summary,
-        description: description.join('\n'),
-        start: selectedSlot.start,
-        end: selectedSlot.end,
-        guests: currentAppointmentDetails.email ? [currentAppointmentDetails.email] : [],
-        timeZone: config.businessTimeZone,
-        logger,
-      });
-      eventId = event.id;
-      logger.info('Calendar event created', {
-        eventId,
-        slot: selectedSlot.label,
-        business,
-      });
-      logger.info('CALENDAR_EVENT_CREATED', { eventId, slot: selectedSlot.label, business });
-
-      if (currentAppointmentDetails.email) {
-        await sendEmailConfirmation();
-      } else {
-        bookingCompleted = true;
-        const patientName = currentAppointmentDetails.name || 'Patient';
-        const date = selectedSlot.start.toLocaleDateString('en-US', {
-          timeZone: config.businessTimeZone,
-        });
-        const time = selectedSlot.start.toLocaleTimeString('en-US', {
-          hour: 'numeric',
-          minute: '2-digit',
-          hour12: true,
-          timeZone: config.businessTimeZone,
-        });
-
-        logger.info('Appointment confirmed without email address', { eventId, patientName, date, time });
-        logger.info('BOOKING_COMPLETED', { eventId, slot: selectedSlot.label, date, time });
-        logger.info('Goodbye initiated', { reason: 'booking completed', eventId });
-        openai.sendTextInstruction(
-          `Your appointment has been successfully booked for ${date} at ${time}. Thank you for choosing our clinic. We look forward to seeing you. Have a wonderful day. Goodbye.`
-        );
-      }
-    } catch (err) {
-      logger.error('Failed to create calendar appointment', { error: err.message, business });
-      openai.sendTextInstruction(
-        'I\'m sorry, I couldn\'t book that appointment at the moment. Can I try again or would you like a different time?'
-      );
-    }
+    await submitBookingWebhook();
   }
 
-  async function sendEmailConfirmation() {
-    const patientName = currentAppointmentDetails.name || 'Patient';
-    const date = selectedSlot.start.toLocaleDateString('en-US', {
-      timeZone: config.businessTimeZone,
-    });
-    const time = selectedSlot.start.toLocaleTimeString('en-US', {
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-      timeZone: config.businessTimeZone,
-    });
-    const reason = currentAppointmentDetails.reason || 'N/A';
+  function maybeAnnounceSummary() {
+    if (!hasRequiredBookingInfo() || bookingSummaryAnnounced) return;
+    bookingSummaryAnnounced = true;
+
+    openai.sendTextInstruction(
+      `I have the following details: ${currentAppointmentDetails.name}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone)}, email ${currentAppointmentDetails.email}, appointment date ${currentAppointmentDetails.appointmentDate}, appointment time ${currentAppointmentDetails.appointmentTime}, and reason ${currentAppointmentDetails.reason}. Shall I confirm your appointment?`
+    );
+  }
+
+  async function submitBookingWebhook() {
+    const payload = {
+      name: currentAppointmentDetails.name,
+      phone: currentAppointmentDetails.phone,
+      email: currentAppointmentDetails.email,
+      appointment_date: currentAppointmentDetails.appointmentDate,
+      appointment_time: currentAppointmentDetails.appointmentTime,
+      reason: currentAppointmentDetails.reason,
+    };
+
+    logger.info('BOOKING_WEBHOOK_REQUEST', { url: bookingWebhookUrl, payload });
 
     try {
-      const emailResult = await sendConfirmationEmail({
-        to: currentAppointmentDetails.email,
-        patientName,
-        date,
-        time,
-        reason,
+      const response = await fetch(bookingWebhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
       });
-      eventId = eventId || null;
+
+      const contentType = response.headers.get('content-type') || '';
+      const responseBody = contentType.includes('application/json')
+        ? await response.json()
+        : await response.text();
+
+      if (!response.ok) {
+        const message = extractWebhookError(responseBody) || `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+
+      if (typeof responseBody === 'object' && responseBody && responseBody.success === false) {
+        throw new Error(responseBody.error || responseBody.message || 'Webhook returned unsuccessful response');
+      }
+
       bookingCompleted = true;
-      logger.info('Confirmation email sent', { emailResult, eventId });
-      logger.info('EMAIL_SENT', { eventId, emailResult });
-      logger.info('BOOKING_COMPLETED', { eventId, slot: selectedSlot.label, date, time });
-      logger.info('Goodbye initiated', { reason: 'booking completed', eventId });
+      logger.info('BOOKING_COMPLETED', { responseStatus: response.status });
+      logger.info('Goodbye initiated', { reason: 'booking completed via webhook' });
       openai.sendTextInstruction(
-        `Your appointment has been successfully booked for ${date} at ${time}. A confirmation email has been sent to ${currentAppointmentDetails.email}. We look forward to seeing you. Have a wonderful day. Goodbye.`
+        'Your appointment has been confirmed. You\'ll receive your confirmation shortly.'
       );
     } catch (err) {
-      logger.error('Confirmation email failed', { error: err.message, eventId });
-      logger.info('Goodbye initiated', { reason: 'booking completed without email', eventId });
+      bookingFlowStarted = false;
+      bookingConfirmed = false;
+      logger.error('BOOKING_WEBHOOK_FAILED', { error: err.message });
       openai.sendTextInstruction(
-        `Your appointment has been successfully booked for ${date} at ${time}. I was unable to send the confirmation email, but your booking is complete. We look forward to seeing you. Have a wonderful day. Goodbye.`
+        `I\'m sorry, I couldn\'t confirm the appointment just now. ${err.message}. Please try again in a moment.`
       );
     }
   }
@@ -708,86 +419,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     return phone.replace(/(\d)/g, '$1 ').trim();
   }
 
-  async function offerNextAvailableSlots(reason) {
-    const redirectUri = getGoogleRedirectUri();
-    const business = config.openai.businessName;
-    const now = DateTime.now().setZone(config.businessTimeZone);
-    const start = DateTime.fromJSDate(selectedSlot.end, { zone: config.businessTimeZone });
-    const end = start.plus({ days: config.booking.daysAhead || 3 });
-
-    logger.info('Requesting next available slots after busy selection', {
-      business,
-      start: start.toISO(),
-      end: end.toISO(),
-      reason,
-    });
-
-    selectedSlot = null;
-    bookingSummaryAnnounced = false;
-    bookingConfirmed = false;
-
-    try {
-      const slots = await getAvailabilitySlots({
-        clientId: config.google.clientId,
-        clientSecret: config.google.clientSecret,
-        redirectUri,
-        business,
-        calendarId: 'primary',
-        start: start.toJSDate(),
-        end: end.toJSDate(),
-        slotMinutes: config.booking.slotMinutes,
-        dayStartHour: config.booking.dayStartHour,
-        dayEndHour: config.booking.dayEndHour,
-        timeZone: config.businessTimeZone,
-        logger,
-      });
-
-      availableSlots = slots;
-      logger.info('Google Calendar API response received for next available slots', {
-        business,
-        slotCount: availableSlots.length,
-        reason,
-      });
-    } catch (err) {
-      logger.error('Failed to retrieve next available slots', { error: err.message, business });
-      openai.sendTextInstruction('I am having trouble checking additional availability right now. Can I try a different time?');
-    }
-  }
-
-  async function updateExistingAppointment() {
-    if (!eventId) return;
-    const redirectUri = getGoogleRedirectUri();
-    const business = config.openai.businessName;
-    const updates = {};
-
-    if (currentAppointmentDetails.email) {
-      updates.attendees = [{ email: currentAppointmentDetails.email }];
-    }
-    if (currentAppointmentDetails.name || currentAppointmentDetails.phone || currentAppointmentDetails.email || currentAppointmentDetails.reason) {
-      const description = [`Patient Name: ${currentAppointmentDetails.name || 'N/A'}`];
-      description.push(`Phone Number: ${currentAppointmentDetails.phone || 'N/A'}`);
-      description.push(`Email Address: ${currentAppointmentDetails.email || 'N/A'}`);
-      description.push(`Reason for Visit: ${currentAppointmentDetails.reason || 'N/A'}`);
-      description.push('Booked via Korwexa AI Receptionist');
-      updates.description = description.join('\n');
-    }
-
-    if (!Object.keys(updates).length) return;
-
-    try {
-      await updateAppointment({
-        clientId: config.google.clientId,
-        clientSecret: config.google.clientSecret,
-        redirectUri,
-        business,
-        calendarId: 'primary',
-        eventId,
-        updates,
-      });
-      logger.info('Updated existing calendar appointment', { eventId });
-    } catch (err) {
-      logger.error('Failed to update calendar appointment', { error: err.message, business });
-    }
+  function extractWebhookError(responseBody) {
+    if (!responseBody) return null;
+    if (typeof responseBody === 'string') return responseBody.trim() || null;
+    if (typeof responseBody.error === 'string' && responseBody.error.trim()) return responseBody.error.trim();
+    if (typeof responseBody.message === 'string' && responseBody.message.trim()) return responseBody.message.trim();
+    return null;
   }
 
   function scheduleDisconnectIfNeeded() {
