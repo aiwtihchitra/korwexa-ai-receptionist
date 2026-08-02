@@ -39,6 +39,24 @@ const { EventEmitter } = require('events');
 const WebSocket = require('ws');
 
 const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime';
+const BOOKING_STATE_TOOL = Object.freeze({
+  type: 'function',
+  name: 'sync_booking_state',
+  description:
+    'Sync structured booking details collected in the conversation. Use this whenever booking fields are captured or updated.',
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      phone: { type: 'string' },
+      email: { type: 'string' },
+      appointmentDate: { type: 'string' },
+      appointmentTime: { type: 'string' },
+      reason: { type: 'string' },
+    },
+    additionalProperties: false,
+  },
+});
 
 // Map the legacy shorthand ("g711_ulaw" / "g711_alaw" / "pcm16") to the GA
 // nested audio format object. Anything else is passed through unchanged so
@@ -124,6 +142,8 @@ class OpenAIRealtimeClient extends EventEmitter {
         type: 'realtime',
         model: this.config.model,
         instructions: this.config.systemPrompt,
+        tools: [BOOKING_STATE_TOOL],
+        tool_choice: 'auto',
         output_modalities: ['audio'],
         audio: {
           input: {
@@ -219,9 +239,49 @@ class OpenAIRealtimeClient extends EventEmitter {
         this.emit('error', new Error(event.error?.message || 'OpenAI Realtime error'));
         break;
 
+      case 'response.function_call_arguments.done':
+        this._emitToolCallFromEvent(event);
+        break;
+
+      case 'response.output_item.done':
+        if (event.item?.type === 'function_call') {
+          this._emitToolCallFromEvent({
+            name: event.item.name,
+            arguments: event.item.arguments,
+            call_id: event.item.call_id,
+          });
+        }
+        break;
+
       default:
         this.logger.debug('OpenAI event', { type: event.type });
     }
+  }
+
+  _emitToolCallFromEvent(event) {
+    const name = event?.name;
+    const rawArgs = event?.arguments;
+    if (!name) return;
+
+    let args = {};
+    if (typeof rawArgs === 'string' && rawArgs.trim()) {
+      try {
+        args = JSON.parse(rawArgs);
+      } catch (err) {
+        this.logger.warn('Failed to parse tool call arguments', {
+          name,
+          error: err.message,
+          arguments: rawArgs,
+        });
+        return;
+      }
+    }
+
+    this.emit('tool_call', {
+      name,
+      arguments: args,
+      callId: event.call_id || null,
+    });
   }
 
   _onError(err) {
@@ -346,6 +406,29 @@ class OpenAIRealtimeClient extends EventEmitter {
         ],
       },
     });
+    this._send({
+      type: 'response.create',
+      response: {
+        output_modalities: ['audio'],
+      },
+    });
+    return true;
+  }
+
+  submitToolResult(callId, output) {
+    if (!callId) return false;
+    const outputText = typeof output === 'string' ? output : JSON.stringify(output || {});
+    const created = this._send({
+      type: 'conversation.item.create',
+      item: {
+        type: 'function_call_output',
+        call_id: callId,
+        output: outputText,
+      },
+    });
+
+    if (!created) return false;
+
     this._send({
       type: 'response.create',
       response: {

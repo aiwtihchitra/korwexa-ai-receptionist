@@ -40,6 +40,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let appointmentDetailsCollected = false;
   let bookingFlowStarted = false;
   let bookingCompleted = false;
+  let lastStructuredSyncAt = null;
+  let lastStructuredSyncCallId = null;
+  let lastStructuredSyncPayload = null;
   const bookingWebhookUrl = 'https://aiwithchitra.app.n8n.cloud/webhook/sara-booking';
   let currentAppointmentDetails = {
     name: null,
@@ -96,8 +99,6 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       logger.info('transcript', { role, text });
 
       if (role === 'assistant') {
-        syncBookingDetailsFromAssistantSummary(text);
-
         if (!finalGoodbyeDetected && /thank you for choosing our clinic[\s,\.]*we look forward to seeing you[\s,\.]*have a wonderful day[\s,\.]*goodbye/i.test(text)) {
           if (bookingCompleted) {
             finalGoodbyeDetected = true;
@@ -119,6 +120,24 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
   openai.on('close', (code, reason) => {
     logger.warn('OpenAI closed', { code, reason });
+  });
+
+  openai.on('tool_call', ({ name, arguments: toolArgs, callId }) => {
+    if (name !== 'sync_booking_state') return;
+
+    const appliedFields = applyStructuredBookingState({
+      payload: toolArgs,
+      callId,
+      sourceObjectName: 'openaiTool.sync_booking_state.arguments',
+    });
+
+    if (callId) {
+      openai.submitToolResult(callId, {
+        ok: true,
+        appliedFields,
+        bookingState: { ...currentAppointmentDetails },
+      });
+    }
   });
 
   // --- Twilio -> OpenAI ---------------------------------------------------
@@ -391,6 +410,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       bookingState: stateSnapshot.bookingState,
       sessionState: stateSnapshot.sessionState,
       fieldSources: stateSnapshot.fieldSources,
+      lastStructuredSyncAt: stateSnapshot.sessionState.lastStructuredSyncAt,
+      lastStructuredSyncCallId: stateSnapshot.sessionState.lastStructuredSyncCallId,
+      lastStructuredSyncPayload: stateSnapshot.sessionState.lastStructuredSyncPayload,
       missingFieldsInput,
       expectedStateObject: 'currentAppointmentDetails',
       objectsWithRequiredFields: listObjectsContainingRequiredFields(stateSnapshot),
@@ -413,7 +435,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         sessionState: stateSnapshot.sessionState,
         fieldSources: stateSnapshot.fieldSources,
         expectedStateObject: 'currentAppointmentDetails',
-        rootCauseHint: 'Assistant may have conversational details not yet synchronized into currentAppointmentDetails.',
+          rootCauseHint: 'Structured booking sync payload did not provide all required fields.',
       });
       return;
     }
@@ -529,50 +551,109 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     return true;
   }
 
-  function syncBookingDetailsFromAssistantSummary(text) {
-    // Keep the server booking state aligned with details Sara speaks out loud.
-    if (!text || !/confirm your appointment|appointment date|appointment time|reason/i.test(text)) return;
+  function applyStructuredBookingState({ payload, callId, sourceObjectName }) {
+    const normalizedPayload = normalizeStructuredBookingPayload(payload || {});
+    const destinationBefore = { ...currentAppointmentDetails };
+    const appliedFields = [];
 
-    const details = extractDetailsFromAssistantSummary(text);
-    let updated = false;
-    updated = setBookingField('name', details.name, 'assistant_summary') || updated;
-    updated = setBookingField('phone', details.phone, 'assistant_summary') || updated;
-    updated = setBookingField('email', details.email, 'assistant_summary') || updated;
-    updated = setBookingField('appointmentDate', details.appointmentDate, 'assistant_summary') || updated;
-    updated = setBookingField('appointmentTime', details.appointmentTime, 'assistant_summary') || updated;
-    updated = setBookingField('reason', details.reason, 'assistant_summary') || updated;
+    if (setBookingField('name', normalizedPayload.name, 'assistant_tool')) appliedFields.push('name');
+    if (setBookingField('phone', normalizedPayload.phone, 'assistant_tool')) appliedFields.push('phone');
+    if (setBookingField('email', normalizedPayload.email, 'assistant_tool')) appliedFields.push('email');
+    if (setBookingField('appointmentDate', normalizedPayload.appointmentDate, 'assistant_tool')) appliedFields.push('appointmentDate');
+    if (setBookingField('appointmentTime', normalizedPayload.appointmentTime, 'assistant_tool')) appliedFields.push('appointmentTime');
+    if (setBookingField('reason', normalizedPayload.reason, 'assistant_tool')) appliedFields.push('reason');
 
-    if (updated) {
-      logger.info('Synchronized booking details from assistant summary', {
-        synchronizedFields: Object.keys(details).filter((key) => Boolean(details[key])),
-        currentAppointmentDetails,
-      });
+    if (appliedFields.length) {
+      bookingSummaryAnnounced = false;
     }
+
+    lastStructuredSyncAt = new Date().toISOString();
+    lastStructuredSyncCallId = callId || null;
+    lastStructuredSyncPayload = normalizedPayload;
+
+    logFieldMapping({
+      sourceObjectName,
+      source: normalizedPayload,
+      destinationBefore,
+      destinationAfter: { ...currentAppointmentDetails },
+    });
+
+    logger.info('STRUCTURED_BOOKING_SYNC_APPLIED', {
+      callId,
+      appliedFields,
+      hasRequiredBookingInfo: hasRequiredBookingInfo(),
+      bookingState: currentAppointmentDetails,
+      missingFields: getMissingBookingFields(),
+    });
+
+    return appliedFields;
   }
 
-  function extractDetailsFromAssistantSummary(text) {
-    const condensed = text.replace(/\s+/g, ' ').trim();
-    const details = {};
+  function normalizeStructuredBookingPayload(payload) {
+    return {
+      name: normalizeBookingString(payload.name),
+      phone: normalizePhone(payload.phone),
+      email: normalizeEmail(payload.email),
+      appointmentDate: normalizeBookingString(payload.appointmentDate),
+      appointmentTime: normalizeBookingString(payload.appointmentTime),
+      reason: normalizeBookingString(payload.reason),
+    };
+  }
 
-    const nameMatch = condensed.match(/details:\s*([^,.;]+?),\s*phone\s+number/i);
-    if (nameMatch) details.name = nameMatch[1].trim();
+  function normalizeBookingString(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
 
-    const phoneMatch = condensed.match(/phone\s+number\s+([^,.;]+?)(?:,|\s+email\s+)/i);
-    if (phoneMatch) details.phone = (phoneMatch[1].replace(/[^\d]/g, '').trim()) || null;
+  function normalizePhone(value) {
+    if (typeof value !== 'string') return null;
+    const cleaned = value.replace(/[^\d]/g, '');
+    return cleaned || null;
+  }
 
-    const emailMatch = condensed.match(/email\s+([^,.;]+?)(?:,|\s+appointment\s+date\s+)/i);
-    if (emailMatch) details.email = parseEmail(emailMatch[1]);
+  function normalizeEmail(value) {
+    if (typeof value !== 'string') return null;
+    return value.trim().toLowerCase() || null;
+  }
 
-    const dateMatch = condensed.match(/appointment\s+date\s+([^,.;]+?)(?:,|\s+appointment\s+time\s+)/i);
-    if (dateMatch) details.appointmentDate = dateMatch[1].trim();
-
-    const timeMatch = condensed.match(/appointment\s+time\s+([^,.;]+?)(?:,|\s+and\s+reason\s+|\s+reason\s+)/i);
-    if (timeMatch) details.appointmentTime = timeMatch[1].trim().toLowerCase();
-
-    const reasonMatch = condensed.match(/reason\s+(.+?)(?:\.\s*shall\s+i\s+confirm\s+your\s+appointment\??|$)/i);
-    if (reasonMatch) details.reason = reasonMatch[1].trim();
-
-    return details;
+  function logFieldMapping({ sourceObjectName, source, destinationBefore, destinationAfter }) {
+    logger.info('FIELD_MAPPING', {
+      stage: 'ai_extraction_to_booking_state',
+      extractionSourceObject: sourceObjectName,
+      synchronizationReadObject: sourceObjectName,
+      confirmationValidationObject: 'currentAppointmentDetails',
+      name: {
+        source: source.name,
+        destinationBefore: destinationBefore.name,
+        destination: destinationAfter.name,
+      },
+      phone: {
+        source: source.phone,
+        destinationBefore: destinationBefore.phone,
+        destination: destinationAfter.phone,
+      },
+      email: {
+        source: source.email,
+        destinationBefore: destinationBefore.email,
+        destination: destinationAfter.email,
+      },
+      appointmentDate: {
+        source: source.appointmentDate,
+        destinationBefore: destinationBefore.appointmentDate,
+        destination: destinationAfter.appointmentDate,
+      },
+      appointmentTime: {
+        source: source.appointmentTime,
+        destinationBefore: destinationBefore.appointmentTime,
+        destination: destinationAfter.appointmentTime,
+      },
+      reason: {
+        source: source.reason,
+        destinationBefore: destinationBefore.reason,
+        destination: destinationAfter.reason,
+      },
+    });
   }
 
   function buildBookingStateSnapshot() {
@@ -590,6 +671,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         bookingConfirmed,
         bookingFlowStarted,
         bookingCompleted,
+        lastStructuredSyncAt,
+        lastStructuredSyncCallId,
+        lastStructuredSyncPayload,
       },
       fieldSources: {
         ...bookingFieldSources,
