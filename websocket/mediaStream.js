@@ -42,7 +42,6 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let closed = false;
   let markCounter = 0;
   let finalGoodbyeDetected = false;
-  let goodbyeAudioFinished = false;
   let disconnectScheduled = false;
   let autoContinueTimer = null;
   let awaitingAutoContinue = false;
@@ -52,6 +51,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let eventId = null;
   let bookingConfirmed = false;
   let bookingSummaryAnnounced = false;
+  let appointmentDetailsCollected = false;
   let currentAppointmentDetails = {
     name: null,
     email: null,
@@ -89,22 +89,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       mark: { name: `assistant-turn-${markCounter}` },
     });
 
-    if (finalGoodbyeDetected && !disconnectScheduled) {
-      disconnectScheduled = true;
-      setTimeout(() => {
-        if (closed) return;
-        logger.info('Final goodbye audio finished, closing Twilio call');
-        cleanup(1000, 'assistant goodbye');
-      }, 1000);
-    }
-  });
-
-  openai.on('speech.started', () => {
-    // Barge-in: user started talking while assistant was speaking.
-    // Cancel the model response and clear any queued audio at Twilio.
-    logger.debug('User speech detected — cancelling assistant response');
-    openai.cancelResponse();
-    if (streamSid) twilioSend({ event: 'clear', streamSid });
+    scheduleDisconnectIfNeeded();
   });
 
   openai.on('transcript', ({ role, text, partial }) => {
@@ -117,7 +102,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
           scheduleAutoContinue();
         }
 
-        if (!finalGoodbyeDetected && /have a wonderful day\. goodbye\.|we look forward to seeing you\.?\s*goodbye\./i.test(text)) {
+        if (!finalGoodbyeDetected && /thank you for choosing our clinic[\s,\.]*we look forward to seeing you[\s,\.]*have a wonderful day[\s,\.]*goodbye/i.test(text)) {
           finalGoodbyeDetected = true;
         }
       }
@@ -209,6 +194,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   function cleanup(code, reason) {
     if (closed) return;
     closed = true;
+    logger.info('Twilio disconnect initiated', { code, reason });
     try {
       openai.close();
     } catch {
@@ -250,6 +236,8 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       .plus({ days: config.booking.daysAhead })
       .set({ hour: config.booking.dayEndHour, minute: 0, second: 0, millisecond: 0 });
 
+    logger.info('Booking function entered', { function: 'offerAvailableSlots' });
+    logger.info('Business identified', { business });
     logger.info('Requesting Google Calendar availability', {
       business,
       start: start.toISO(),
@@ -269,11 +257,18 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         end: end.toJSDate(),
         slotMinutes: config.booking.slotMinutes,
         timeZone: config.businessTimeZone,
+        logger,
+      });
+      logger.info('Google Calendar API response received', {
+        business,
+        requestedStart: start.toISO(),
+        requestedEnd: end.toISO(),
+        slotCount: slots.length,
       });
     } catch (err) {
       logger.error('Google Calendar availability request failed', { error: err.message, business });
       openai.sendTextInstruction(
-        'I\'m sorry, I can\'t access the calendar right now. Please let me know the date and time you need, and I will follow up once the calendar connection is restored.'
+        'I\'m sorry, I am having trouble checking the calendar right now. Can I try again in a moment or would you like a different time?'
       );
       return;
     }
@@ -282,6 +277,11 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     logger.info('Available slots', { availableSlots: availableSlots.map((slot) => slot.label) });
 
     if (!availableSlots.length) {
+      logger.warn('No available slots were found after calendar check', {
+        business,
+        start: start.toISO(),
+        end: end.toISO(),
+      });
       openai.sendTextInstruction(
         'Thank you for waiting. I checked the calendar and it looks like there are no available slots in the next few days. Would another day work for you?'
       );
@@ -357,10 +357,23 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       currentAppointmentDetails.reason = reason;
       logger.debug('Captured reason for visit from user transcript', { reason });
     }
-    if (selected && !selectedSlot) {
-      selectedSlot = selected;
-      logger.info('Caller selected an available slot', { slot: selectedSlot.label });
-      maybeAnnounceSummary();
+    if (!appointmentDetailsCollected && currentAppointmentDetails.name && currentAppointmentDetails.email && currentAppointmentDetails.phone && currentAppointmentDetails.reason) {
+      appointmentDetailsCollected = true;
+      logger.info('Appointment details collected', {
+        name: currentAppointmentDetails.name,
+        email: currentAppointmentDetails.email,
+        phone: currentAppointmentDetails.phone,
+        reason: currentAppointmentDetails.reason,
+      });
+    }
+    if (selected) {
+      if (!selectedSlot || selectedSlot.label !== selected.label) {
+        selectedSlot = selected;
+        bookingSummaryAnnounced = false;
+        bookingConfirmed = false;
+        logger.info('Caller selected an available slot', { slot: selectedSlot.label });
+        maybeAnnounceSummary();
+      }
     }
     if (confirmation && selectedSlot && !bookingConfirmed) {
       bookingConfirmed = true;
@@ -372,7 +385,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function parseName(text) {
-    const match = text.match(/(?:my name is|this is|I am|I'm|it\'s)\s+([A-Za-z][A-Za-z\s'-]{1,60})/i);
+    const match = text.match(/(?:my name is|this is|i\'m|i am)\s+([A-Za-z][A-Za-z]+(?:[ '\-][A-Za-z]+){0,3})/i);
     return match ? match[1].trim() : null;
   }
 
@@ -382,14 +395,16 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function parsePhoneFragment(text) {
-    const match = text.match(/(\+?\d[\d\s().-]{7,}\d)/);
-    return match ? match[0].trim() : null;
+    const match = text.match(/(?:phone number is|my number is|call me at|number is|phone is)\s*(\+?[\d][\d\s().-]{7,}\d)/i);
+    if (!match) return null;
+    const cleaned = match[1].replace(/[^\d]/g, '');
+    if (cleaned.length < 10 || cleaned.length > 15) return null;
+    return cleaned;
   }
 
   function parseReason(text) {
-    const match = text.match(/reason(?: for visit)? is\s+([A-Za-z0-9\s,'-]+)/i);
-    if (match) return match[1].trim();
-    return null;
+    const match = text.match(/reason(?: for visit)? is\s+([A-Za-z0-9\s,'\-]+)/i);
+    return match ? match[1].trim() : null;
   }
 
   function parseSelectedSlot(text) {
@@ -401,22 +416,97 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function parseConfirmation(text) {
-    return /\b(yes|confirm|sure|please do|that sounds good)\b/i.test(text);
+    return /\b(yes|confirm|sure|please do|that sounds good|that works|sounds good|go ahead)\b/i.test(text);
   }
 
   async function maybeAnnounceSummary() {
     if (!selectedSlot || bookingSummaryAnnounced) return;
     bookingSummaryAnnounced = true;
 
+    const missingFields = [];
+    if (!currentAppointmentDetails.name) missingFields.push('your full name');
+    if (!currentAppointmentDetails.phone) missingFields.push('your phone number');
+    if (!currentAppointmentDetails.email) missingFields.push('your email address');
+
+    if (missingFields.length) {
+      openai.sendTextInstruction(
+        `I have your appointment time as ${selectedSlot.label}. Could you please provide ${missingFields.join(' and ')}?`
+      );
+      return;
+    }
+
     openai.sendTextInstruction(
-      `I have the following details: ${currentAppointmentDetails.name || 'no name yet'}, for ${selectedSlot.label}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone || 'not provided')}, email ${currentAppointmentDetails.email || 'not provided'}, and reason ${currentAppointmentDetails.reason || 'not provided'}. Shall I confirm your appointment?`
+      `I have the following details: ${currentAppointmentDetails.name}, for ${selectedSlot.label}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone)}, email ${currentAppointmentDetails.email}, and reason ${currentAppointmentDetails.reason || 'not provided'}. Shall I confirm your appointment?`
     );
   }
 
   async function confirmAppointment() {
-    if (!selectedSlot || !bookingConfirmed || eventId) return;
+    if (!selectedSlot) {
+      logger.warn('confirmAppointment exited early', { reason: 'no selected slot' });
+      return;
+    }
+    if (!bookingConfirmed) {
+      logger.warn('confirmAppointment exited early', { reason: 'booking not confirmed' });
+      return;
+    }
+    if (eventId) {
+      logger.warn('confirmAppointment exited early', { reason: 'appointment already created', eventId });
+      return;
+    }
+
+    logger.info('Booking function entered', { function: 'confirmAppointment', slot: selectedSlot.label });
+
+    const missingFields = [];
+    if (!currentAppointmentDetails.name) missingFields.push('name');
+    if (!currentAppointmentDetails.phone) missingFields.push('phone number');
+    if (!currentAppointmentDetails.email) missingFields.push('email address');
+
+    if (missingFields.length) {
+      bookingConfirmed = false;
+      logger.warn('confirmAppointment missing required appointment details', { missingFields });
+      openai.sendTextInstruction(
+        `Before I book the appointment, I need ${missingFields.join(' and ')}. Could you provide that information?`
+      );
+      return;
+    }
+
     const redirectUri = getGoogleRedirectUri();
     const business = config.openai.businessName;
+
+    try {
+      const slotStatus = await checkAvailability({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+        calendarId: 'primary',
+        timeMin: selectedSlot.start.toISOString(),
+        timeMax: selectedSlot.end.toISOString(),
+        logger,
+      });
+
+      logger.info('Checking selected slot availability', {
+        business,
+        slot: selectedSlot.label,
+        status: slotStatus,
+      });
+      logger.info('Google Calendar availability response received', {
+        business,
+        slot: selectedSlot.label,
+        status: slotStatus,
+      });
+
+      if (slotStatus === 'busy') {
+        logger.warn('Selected slot is no longer available', { slot: selectedSlot.label, business });
+        await offerNextAvailableSlots('selected slot busy');
+        return;
+      }
+    } catch (err) {
+      logger.error('Failed to verify slot availability', { error: err.message, business });
+      openai.sendTextInstruction('I am having trouble checking that time with the calendar right now. Can I try a different time?');
+      return;
+    }
+
     const summary = `Appointment - ${currentAppointmentDetails.name || 'Patient'}`;
     const description = [`Patient Name: ${currentAppointmentDetails.name || 'N/A'}`];
     description.push(`Phone Number: ${currentAppointmentDetails.phone || 'N/A'}`);
@@ -437,9 +527,10 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         end: selectedSlot.end,
         guests: currentAppointmentDetails.email ? [currentAppointmentDetails.email] : [],
         timeZone: config.businessTimeZone,
+        logger,
       });
       eventId = event.id;
-      logger.info('Appointment created', {
+      logger.info('Calendar event created', {
         eventId,
         slot: selectedSlot.label,
         business,
@@ -460,8 +551,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         });
 
         logger.info('Appointment confirmed without email address', { eventId, patientName, date, time });
+        logger.info('Goodbye initiated', { reason: 'booking completed', eventId });
         openai.sendTextInstruction(
-          `Your appointment has been confirmed for ${date} at ${time}. I do not have an email address to send confirmation to yet. If you would like a confirmation email, please provide your email address now.`
+          `Your appointment has been successfully booked for ${date} at ${time}. Thank you for choosing our clinic. We look forward to seeing you. Have a wonderful day. Goodbye.`
         );
       }
     } catch (err) {
@@ -494,19 +586,67 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         reason,
       });
       logger.info('Confirmation email sent', { emailResult, eventId });
+      logger.info('Goodbye initiated', { reason: 'booking completed', eventId });
       openai.sendTextInstruction(
-        `Your appointment has been confirmed for ${date} at ${time}. A confirmation email has been sent to ${currentAppointmentDetails.email}. We look forward to seeing you. Have a wonderful day. Goodbye.`
+        `Your appointment has been successfully booked for ${date} at ${time}. A confirmation email has been sent to ${currentAppointmentDetails.email}. We look forward to seeing you. Have a wonderful day. Goodbye.`
       );
     } catch (err) {
       logger.error('Confirmation email failed', { error: err.message, eventId });
+      logger.info('Goodbye initiated', { reason: 'booking completed without email', eventId });
       openai.sendTextInstruction(
-        `Your appointment has been confirmed for ${date} at ${time}. I was unable to send the confirmation email, but your booking is complete. We look forward to seeing you. Have a wonderful day. Goodbye.`
+        `Your appointment has been successfully booked for ${date} at ${time}. I was unable to send the confirmation email, but your booking is complete. We look forward to seeing you. Have a wonderful day. Goodbye.`
       );
     }
   }
 
   function formatPhoneForSpeech(phone) {
     return phone.replace(/(\d)/g, '$1 ').trim();
+  }
+
+  async function offerNextAvailableSlots(reason) {
+    const redirectUri = getGoogleRedirectUri();
+    const business = config.openai.businessName;
+    const now = DateTime.now().setZone(config.businessTimeZone);
+    const start = DateTime.fromJSDate(selectedSlot.end, { zone: config.businessTimeZone });
+    const end = start.plus({ days: config.booking.daysAhead || 3 });
+
+    logger.info('Requesting next available slots after busy selection', {
+      business,
+      start: start.toISO(),
+      end: end.toISO(),
+      reason,
+    });
+
+    selectedSlot = null;
+    bookingSummaryAnnounced = false;
+    bookingConfirmed = false;
+
+    try {
+      const slots = await getAvailabilitySlots({
+        clientId: config.google.clientId,
+        clientSecret: config.google.clientSecret,
+        redirectUri,
+        business,
+        calendarId: 'primary',
+        start: start.toJSDate(),
+        end: end.toJSDate(),
+        slotMinutes: config.booking.slotMinutes,
+        dayStartHour: config.booking.dayStartHour,
+        dayEndHour: config.booking.dayEndHour,
+        timeZone: config.businessTimeZone,
+        logger,
+      });
+
+      availableSlots = slots;
+      logger.info('Google Calendar API response received for next available slots', {
+        business,
+        slotCount: availableSlots.length,
+        reason,
+      });
+    } catch (err) {
+      logger.error('Failed to retrieve next available slots', { error: err.message, business });
+      openai.sendTextInstruction('I am having trouble checking additional availability right now. Can I try a different time?');
+    }
   }
 
   async function updateExistingAppointment() {
@@ -550,9 +690,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     disconnectScheduled = true;
     setTimeout(() => {
       if (closed) return;
-      logger.info('Final goodbye detected, closing Twilio call automatically');
+      logger.info('Twilio disconnect initiated after final goodbye');
       cleanup(1000, 'assistant goodbye');
-    }, 1200);
+    }, 1500);
   }
 }
 

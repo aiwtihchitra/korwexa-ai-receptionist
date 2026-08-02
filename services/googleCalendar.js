@@ -56,8 +56,10 @@ function hasBusinessCalendarConnection({ clientId, clientSecret, redirectUri, bu
   return Boolean(getOAuthClientForBusiness({ clientId, clientSecret, redirectUri, business }));
 }
 
-async function checkAvailability({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', timeMin, timeMax }) {
+async function checkAvailability({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', timeMin, timeMax, logger }) {
   const calendar = await ensureCalendarClient({ clientId, clientSecret, redirectUri, business });
+  if (logger) logger.info('Google OAuth credentials loaded', { business });
+  if (logger) logger.info('Google freebusy query started', { business, timeMin, timeMax, calendarId });
   const response = await calendar.freebusy.query({
     requestBody: {
       timeMin,
@@ -66,15 +68,18 @@ async function checkAvailability({ clientId, clientSecret, redirectUri, business
     },
   });
   const busy = response.data.calendars[calendarId]?.busy || [];
+  if (logger) logger.info('Google freebusy query response received', { business, busyCount: busy.length, calendarId });
   return busy.length === 0 ? 'available' : 'busy';
 }
 
-async function getAvailabilitySlots({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', start, end, slotMinutes, dayStartHour = 9, dayEndHour = 17, timeZone }) {
+async function getAvailabilitySlots({ clientId, clientSecret, redirectUri, business, calendarId = 'primary', start, end, slotMinutes, dayStartHour = 9, dayEndHour = 17, timeZone, logger }) {
   const calendar = await ensureCalendarClient({ clientId, clientSecret, redirectUri, business });
+  if (logger) logger.info('Google OAuth credentials loaded', { business });
   const startDt = start instanceof Date ? DateTime.fromJSDate(start, { zone: timeZone }) : DateTime.fromISO(start, { zone: timeZone });
   const endDt = end instanceof Date ? DateTime.fromJSDate(end, { zone: timeZone }) : DateTime.fromISO(end, { zone: timeZone });
   const now = DateTime.now().setZone(timeZone);
 
+  if (logger) logger.info('Google freebusy query started', { business, start: startDt.toISO(), end: endDt.toISO(), calendarId });
   const response = await calendar.freebusy.query({
     requestBody: {
       timeMin: startDt.toISO(),
@@ -83,6 +88,7 @@ async function getAvailabilitySlots({ clientId, clientSecret, redirectUri, busin
     },
   });
   const busy = response.data.calendars[calendarId]?.busy || [];
+  if (logger) logger.info('Google freebusy query response received', { business, busyCount: busy.length, calendarId });
 
   const slots = [];
   let dayCursor = startDt.startOf('day');
