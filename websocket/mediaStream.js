@@ -49,6 +49,14 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     appointmentTime: null,
     reason: null,
   };
+  const bookingFieldSources = {
+    name: null,
+    email: null,
+    phone: null,
+    appointmentDate: null,
+    appointmentTime: null,
+    reason: null,
+  };
 
   const openai = new OpenAIRealtimeClient({
     config: config.openai,
@@ -88,6 +96,8 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       logger.info('transcript', { role, text });
 
       if (role === 'assistant') {
+        syncBookingDetailsFromAssistantSummary(text);
+
         if (!finalGoodbyeDetected && /thank you for choosing our clinic[\s,\.]*we look forward to seeing you[\s,\.]*have a wonderful day[\s,\.]*goodbye/i.test(text)) {
           if (bookingCompleted) {
             finalGoodbyeDetected = true;
@@ -209,34 +219,28 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     let detailsUpdated = false;
 
     if (name) {
-      currentAppointmentDetails.name = name;
-      detailsUpdated = true;
+      detailsUpdated = setBookingField('name', name, 'user_transcript') || detailsUpdated;
       logger.debug('Captured name from user transcript', { name });
     }
     if (email) {
-      currentAppointmentDetails.email = email;
-      detailsUpdated = true;
+      detailsUpdated = setBookingField('email', email, 'user_transcript') || detailsUpdated;
       logger.debug('Captured email from user transcript', { email });
     }
     if (phoneFragment) {
       const cleaned = phoneFragment.replace(/[^\d]/g, '');
-      currentAppointmentDetails.phone = cleaned;
-      detailsUpdated = true;
+      detailsUpdated = setBookingField('phone', cleaned, 'user_transcript') || detailsUpdated;
       logger.debug('Captured phone fragment from user transcript', { phone: currentAppointmentDetails.phone });
     }
     if (appointmentDate) {
-      currentAppointmentDetails.appointmentDate = appointmentDate;
-      detailsUpdated = true;
+      detailsUpdated = setBookingField('appointmentDate', appointmentDate, 'user_transcript') || detailsUpdated;
       logger.debug('Captured appointment date from user transcript', { appointmentDate });
     }
     if (appointmentTime) {
-      currentAppointmentDetails.appointmentTime = appointmentTime;
-      detailsUpdated = true;
+      detailsUpdated = setBookingField('appointmentTime', appointmentTime, 'user_transcript') || detailsUpdated;
       logger.debug('Captured appointment time from user transcript', { appointmentTime });
     }
     if (reason) {
-      currentAppointmentDetails.reason = reason;
-      detailsUpdated = true;
+      detailsUpdated = setBookingField('reason', reason, 'user_transcript') || detailsUpdated;
       logger.debug('Captured reason for visit from user transcript', { reason });
     }
 
@@ -285,7 +289,18 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
   function parseEmail(text) {
     const match = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/i);
-    return match ? match[0].trim() : null;
+    if (match) return match[0].trim();
+
+    const spokenNormalized = text
+      .toLowerCase()
+      .replace(/\s+at\s+/g, '@')
+      .replace(/\s+dot\s+/g, '.')
+      .replace(/\s+underscore\s+/g, '_')
+      .replace(/\s+dash\s+/g, '-')
+      .replace(/\s+/g, '');
+
+    const spokenMatch = spokenNormalized.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/i);
+    return spokenMatch ? spokenMatch[0].trim() : null;
   }
 
   function parsePhoneFragment(text) {
@@ -298,7 +313,10 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
 
   function parseReason(text) {
     const match = text.match(/reason(?: for visit)? is\s+([A-Za-z0-9\s,'\-]+)/i);
-    return match ? match[1].trim() : null;
+    if (match) return match[1].trim();
+
+    const fallback = text.match(/(?:appointment|visit|consultation)\s+(?:for|about|regarding)\s+([A-Za-z0-9\s,'\-]+)/i);
+    return fallback ? fallback[1].trim() : null;
   }
 
   function parseAppointmentDate(text) {
@@ -364,19 +382,38 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   async function handleBookingConfirmation({ confirmation, transcript }) {
+    const stateSnapshot = buildBookingStateSnapshot();
+    const missingFieldsInput = { ...currentAppointmentDetails };
+    const missingFields = getMissingBookingFieldsFor(missingFieldsInput);
+
+    logger.info('BOOKING_CONFIRMATION_STATE_TRACE', {
+      transcript,
+      bookingState: stateSnapshot.bookingState,
+      sessionState: stateSnapshot.sessionState,
+      fieldSources: stateSnapshot.fieldSources,
+      missingFieldsInput,
+      expectedStateObject: 'currentAppointmentDetails',
+      objectsWithRequiredFields: listObjectsContainingRequiredFields(stateSnapshot),
+    });
+
     logger.info('Entering booking confirmation handler', {
       transcript,
       confirmationDetected: confirmation,
       hasRequiredBookingInfo: hasRequiredBookingInfo(),
       bookingConfirmed,
-      missingFields: getMissingBookingFields(),
+      missingFields,
     });
 
     if (!confirmation) return;
 
     if (!hasRequiredBookingInfo()) {
       logger.warn('Confirmation received but required booking info is missing', {
-        missingFields: getMissingBookingFields(),
+        missingFields,
+        bookingState: stateSnapshot.bookingState,
+        sessionState: stateSnapshot.sessionState,
+        fieldSources: stateSnapshot.fieldSources,
+        expectedStateObject: 'currentAppointmentDetails',
+        rootCauseHint: 'Assistant may have conversational details not yet synchronized into currentAppointmentDetails.',
       });
       return;
     }
@@ -468,14 +505,104 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function getMissingBookingFields() {
+    return getMissingBookingFieldsFor(currentAppointmentDetails);
+  }
+
+  function getMissingBookingFieldsFor(details) {
     const missing = [];
-    if (!currentAppointmentDetails.name) missing.push('name');
-    if (!currentAppointmentDetails.phone) missing.push('phone');
-    if (!currentAppointmentDetails.email) missing.push('email');
-    if (!currentAppointmentDetails.appointmentDate) missing.push('appointmentDate');
-    if (!currentAppointmentDetails.appointmentTime) missing.push('appointmentTime');
-    if (!currentAppointmentDetails.reason) missing.push('reason');
+    if (!details.name) missing.push('name');
+    if (!details.phone) missing.push('phone');
+    if (!details.email) missing.push('email');
+    if (!details.appointmentDate) missing.push('appointmentDate');
+    if (!details.appointmentTime) missing.push('appointmentTime');
+    if (!details.reason) missing.push('reason');
     return missing;
+  }
+
+  function setBookingField(field, value, source) {
+    if (value == null) return false;
+    const normalized = typeof value === 'string' ? value.trim() : value;
+    if (!normalized) return false;
+    if (currentAppointmentDetails[field] === normalized) return false;
+    currentAppointmentDetails[field] = normalized;
+    bookingFieldSources[field] = source;
+    return true;
+  }
+
+  function syncBookingDetailsFromAssistantSummary(text) {
+    // Keep the server booking state aligned with details Sara speaks out loud.
+    if (!text || !/confirm your appointment|appointment date|appointment time|reason/i.test(text)) return;
+
+    const details = extractDetailsFromAssistantSummary(text);
+    let updated = false;
+    updated = setBookingField('name', details.name, 'assistant_summary') || updated;
+    updated = setBookingField('phone', details.phone, 'assistant_summary') || updated;
+    updated = setBookingField('email', details.email, 'assistant_summary') || updated;
+    updated = setBookingField('appointmentDate', details.appointmentDate, 'assistant_summary') || updated;
+    updated = setBookingField('appointmentTime', details.appointmentTime, 'assistant_summary') || updated;
+    updated = setBookingField('reason', details.reason, 'assistant_summary') || updated;
+
+    if (updated) {
+      logger.info('Synchronized booking details from assistant summary', {
+        synchronizedFields: Object.keys(details).filter((key) => Boolean(details[key])),
+        currentAppointmentDetails,
+      });
+    }
+  }
+
+  function extractDetailsFromAssistantSummary(text) {
+    const condensed = text.replace(/\s+/g, ' ').trim();
+    const details = {};
+
+    const nameMatch = condensed.match(/details:\s*([^,.;]+?),\s*phone\s+number/i);
+    if (nameMatch) details.name = nameMatch[1].trim();
+
+    const phoneMatch = condensed.match(/phone\s+number\s+([^,.;]+?)(?:,|\s+email\s+)/i);
+    if (phoneMatch) details.phone = (phoneMatch[1].replace(/[^\d]/g, '').trim()) || null;
+
+    const emailMatch = condensed.match(/email\s+([^,.;]+?)(?:,|\s+appointment\s+date\s+)/i);
+    if (emailMatch) details.email = parseEmail(emailMatch[1]);
+
+    const dateMatch = condensed.match(/appointment\s+date\s+([^,.;]+?)(?:,|\s+appointment\s+time\s+)/i);
+    if (dateMatch) details.appointmentDate = dateMatch[1].trim();
+
+    const timeMatch = condensed.match(/appointment\s+time\s+([^,.;]+?)(?:,|\s+and\s+reason\s+|\s+reason\s+)/i);
+    if (timeMatch) details.appointmentTime = timeMatch[1].trim().toLowerCase();
+
+    const reasonMatch = condensed.match(/reason\s+(.+?)(?:\.\s*shall\s+i\s+confirm\s+your\s+appointment\??|$)/i);
+    if (reasonMatch) details.reason = reasonMatch[1].trim();
+
+    return details;
+  }
+
+  function buildBookingStateSnapshot() {
+    return {
+      bookingState: {
+        ...currentAppointmentDetails,
+      },
+      sessionState: {
+        connectionId,
+        streamSid,
+        callSid,
+        closed,
+        bookingSummaryAnnounced,
+        appointmentDetailsCollected,
+        bookingConfirmed,
+        bookingFlowStarted,
+        bookingCompleted,
+      },
+      fieldSources: {
+        ...bookingFieldSources,
+      },
+    };
+  }
+
+  function listObjectsContainingRequiredFields(stateSnapshot) {
+    const objects = [];
+    if (getMissingBookingFieldsFor(stateSnapshot.bookingState).length === 0) {
+      objects.push('currentAppointmentDetails');
+    }
+    return objects;
   }
 
   function scheduleDisconnectIfNeeded() {
