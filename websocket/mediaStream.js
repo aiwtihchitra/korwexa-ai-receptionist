@@ -377,6 +377,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     logger.info('BOOKING_WEBHOOK_REQUEST', { url: bookingWebhookUrl, payload });
 
     try {
+      logger.info(`Calling n8n booking webhook: ${bookingWebhookUrl}`);
       const response = await fetch(bookingWebhookUrl, {
         method: 'POST',
         headers: {
@@ -384,6 +385,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         },
         body: JSON.stringify(payload),
       });
+      logger.info(`Webhook response status: ${response.status}`);
 
       const contentType = response.headers.get('content-type') || '';
       const responseBody = contentType.includes('application/json')
@@ -408,6 +410,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     } catch (err) {
       bookingFlowStarted = false;
       bookingConfirmed = false;
+      logger.error(`Webhook error: ${err.message}`);
       logger.error('BOOKING_WEBHOOK_FAILED', { error: err.message });
       openai.sendTextInstruction(
         `I\'m sorry, I couldn\'t confirm the appointment just now. ${err.message}. Please try again in a moment.`
