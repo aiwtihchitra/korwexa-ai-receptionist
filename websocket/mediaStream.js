@@ -466,6 +466,17 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
           hasRequiredBookingInfo: hasRequiredBookingInfo(),
           missingFields: getMissingBookingFields(),
         });
+        logger.info('BOOKING_EXECUTION_RETURN', {
+          line: 459,
+          reason: bookingCompleted ? 'bookingCompleted' : 'bookingExecutionInFlight',
+          bookingConfirmed,
+          bookingFlowStarted,
+          bookingExecutionInFlight,
+          bookingCompleted,
+          hasRequiredBookingInfo: hasRequiredBookingInfo(),
+          missingFields: getMissingBookingFields(),
+          trigger,
+        });
         return;
       }
 
@@ -478,6 +489,17 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
           hasRequiredBookingInfo: hasRequiredBookingInfo(),
           missingFields: getMissingBookingFields(),
           bookingState: { ...currentAppointmentDetails },
+        });
+        logger.info('BOOKING_EXECUTION_RETURN', {
+          line: 472,
+          reason: 'missingRequiredBookingInfo',
+          bookingConfirmed,
+          bookingFlowStarted,
+          bookingExecutionInFlight,
+          bookingCompleted,
+          hasRequiredBookingInfo: hasRequiredBookingInfo(),
+          missingFields: getMissingBookingFields(),
+          trigger,
         });
         return;
       }
@@ -499,8 +521,31 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
           bookingCompleted,
           missingFields: getMissingBookingFields(),
         });
+        logger.info('BOOKING_EXECUTION_RETURN', {
+          line: 493,
+          reason: 'bookingConfirmationRequired',
+          bookingConfirmed,
+          bookingFlowStarted,
+          bookingExecutionInFlight,
+          bookingCompleted,
+          hasRequiredBookingInfo: hasRequiredBookingInfo(),
+          missingFields: getMissingBookingFields(),
+          trigger,
+        });
         return;
       }
+
+      logger.info('BOOKING_EXECUTION_CONTINUE', {
+        line: 505,
+        reason: 'all_guards_passed',
+        bookingConfirmed,
+        bookingFlowStarted,
+        bookingExecutionInFlight,
+        bookingCompleted,
+        hasRequiredBookingInfo: hasRequiredBookingInfo(),
+        missingFields: getMissingBookingFields(),
+        trigger,
+      });
 
       logger.info('BOOKING_EXECUTION_PRE_START', {
         trigger,
