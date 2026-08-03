@@ -40,6 +40,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let appointmentDetailsCollected = false;
   let bookingFlowStarted = false;
   let bookingCompleted = false;
+  let bookingExecutionInFlight = false;
   const pendingAssistantInstructions = [];
   let lastStructuredSyncAt = null;
   let lastStructuredSyncCallId = null;
@@ -448,17 +449,19 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         trigger,
         bookingCompleted,
         bookingFlowStarted,
+        bookingExecutionInFlight,
         hasRequiredBookingInfo: hasRequiredBookingInfo(),
         bookingConfirmed,
         missingFields: getMissingBookingFields(),
         activeOpenAIResponse: openai.hasActiveResponse,
       });
 
-      if (bookingCompleted || bookingFlowStarted) {
+      if (bookingCompleted || bookingExecutionInFlight) {
         logger.warn('BOOKING_EXECUTION_EXIT_ALREADY_STARTED_OR_COMPLETED', {
           trigger,
           bookingCompleted,
           bookingFlowStarted,
+          bookingExecutionInFlight,
           bookingConfirmed,
           hasRequiredBookingInfo: hasRequiredBookingInfo(),
           missingFields: getMissingBookingFields(),
@@ -506,6 +509,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       });
 
       bookingFlowStarted = true;
+      bookingExecutionInFlight = true;
       logger.info('BOOKING_STARTED', {
         trigger,
         name: currentAppointmentDetails.name,
@@ -524,12 +528,15 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       });
 
       await submitBookingWebhook();
+      bookingExecutionInFlight = false;
     } catch (err) {
+      bookingExecutionInFlight = false;
       logger.error('BOOKING_EXECUTION_THROW_BEFORE_PRE_START', {
         trigger,
         error: err.message,
         bookingCompleted,
         bookingFlowStarted,
+        bookingExecutionInFlight,
         bookingConfirmed,
         hasRequiredBookingInfo: hasRequiredBookingInfo(),
         missingFields: getMissingBookingFields(),
