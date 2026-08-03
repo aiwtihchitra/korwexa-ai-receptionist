@@ -62,6 +62,26 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     reason: null,
   };
 
+  function setBookingConfirmed(nextValue, reason, context = {}) {
+    const previousValue = bookingConfirmed;
+    bookingConfirmed = nextValue;
+    logger.info('BOOKING_CONFIRMED_MUTATION', {
+      reason,
+      previousValue,
+      nextValue,
+      context,
+      bookingFlowStarted,
+      bookingCompleted,
+      hasRequiredBookingInfo: hasRequiredBookingInfo(),
+      missingFields: getMissingBookingFields(),
+    });
+  }
+
+  logger.info('BOOKING_CONFIRMED_INITIAL_STATE', {
+    bookingConfirmed,
+    reason: 'connection_initialized',
+  });
+
   const openai = new OpenAIRealtimeClient({
     config: config.openai,
     logger,
@@ -115,6 +135,11 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       }
 
       if (role === 'user') {
+        logger.info('BOOKING_CONFIRMATION_RAW_TRANSCRIPT_RECEIVED', {
+          role,
+          partial,
+          transcriptRaw: text,
+        });
         handleUserTranscript(text);
       }
     }
@@ -241,6 +266,15 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     const appointmentDate = parseAppointmentDate(normalized);
     const appointmentTime = parseAppointmentTime(normalized);
     const confirmation = parseConfirmation(normalized);
+    logger.info('BOOKING_CONFIRMATION_NORMALIZED_TRANSCRIPT', {
+      transcriptRaw: text,
+      transcriptNormalized: normalized,
+    });
+    logger.info('BOOKING_CONFIRMATION_PARSER_RESULT', {
+      transcriptNormalized: normalized,
+      confirmationDetected: confirmation,
+      confirmationRegex: '\\b(yes|confirm|sure|please do|that sounds good|that works|sounds good|go ahead)\\b',
+    });
     logger.info('BOOKING_CONFIRMATION_PARSE_INPUT', {
       transcriptRaw: text,
       transcriptNormalized: normalized,
@@ -305,12 +339,25 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       missingFields: getMissingBookingFields(),
     });
 
-    handleBookingConfirmation({ confirmation, transcript: normalized }).catch((err) =>
-      logger.error('handleBookingConfirmation failed', { error: err.message })
-    );
+    handleBookingConfirmation({ confirmation, transcript: normalized })
+      .then((result) => {
+        logger.info('BOOKING_CONFIRMATION_HANDLER_RESULT', {
+          transcript: normalized,
+          confirmation,
+          result,
+          bookingConfirmed,
+          bookingFlowStarted,
+          bookingCompleted,
+        });
+      })
+      .catch((err) =>
+        logger.error('handleBookingConfirmation failed', { error: err.message })
+      );
 
     // Re-check booking flow after processing the latest transcript
-    maybeStartBookingFlow().catch((err) => logger.error('maybeStartBookingFlow failed', { error: err.message }));
+    maybeStartBookingFlow('post_transcript_recheck').catch((err) =>
+      logger.error('maybeStartBookingFlow failed', { error: err.message, trigger: 'post_transcript_recheck' })
+    );
   }
 
   function parseName(text) {
@@ -395,49 +442,100 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     );
   }
 
-  async function maybeStartBookingFlow() {
-    logger.info('BOOKING_EXECUTION_ENTER', {
-      bookingCompleted,
-      bookingFlowStarted,
-      hasRequiredBookingInfo: hasRequiredBookingInfo(),
-      bookingConfirmed,
-      missingFields: getMissingBookingFields(),
-      activeOpenAIResponse: openai.hasActiveResponse,
-    });
+  async function maybeStartBookingFlow(trigger = 'unknown') {
+    try {
+      logger.info('BOOKING_EXECUTION_ENTER', {
+        trigger,
+        bookingCompleted,
+        bookingFlowStarted,
+        hasRequiredBookingInfo: hasRequiredBookingInfo(),
+        bookingConfirmed,
+        missingFields: getMissingBookingFields(),
+        activeOpenAIResponse: openai.hasActiveResponse,
+      });
 
-    if (bookingCompleted || bookingFlowStarted) return;
-    if (!hasRequiredBookingInfo()) return;
+      if (bookingCompleted || bookingFlowStarted) {
+        logger.warn('BOOKING_EXECUTION_EXIT_ALREADY_STARTED_OR_COMPLETED', {
+          trigger,
+          bookingCompleted,
+          bookingFlowStarted,
+          bookingConfirmed,
+          hasRequiredBookingInfo: hasRequiredBookingInfo(),
+          missingFields: getMissingBookingFields(),
+        });
+        return;
+      }
 
-    logger.info('BOOKING_EXECUTION_PRE_CONFIRMATION_GUARD', {
-      bookingConfirmed,
-      hasRequiredBookingInfo: hasRequiredBookingInfo(),
-      bookingFlowStarted,
-      bookingCompleted,
-    });
-    if (!bookingConfirmed) return;
+      if (!hasRequiredBookingInfo()) {
+        logger.warn('BOOKING_EXECUTION_EXIT_MISSING_REQUIRED_INFO', {
+          trigger,
+          bookingCompleted,
+          bookingFlowStarted,
+          bookingConfirmed,
+          hasRequiredBookingInfo: hasRequiredBookingInfo(),
+          missingFields: getMissingBookingFields(),
+          bookingState: { ...currentAppointmentDetails },
+        });
+        return;
+      }
 
-    logger.info('BOOKING_EXECUTION_PRE_START', {
-      bookingState: { ...currentAppointmentDetails },
-      activeOpenAIResponse: openai.hasActiveResponse,
-    });
+      logger.info('BOOKING_EXECUTION_PRE_CONFIRMATION_GUARD', {
+        trigger,
+        bookingConfirmed,
+        hasRequiredBookingInfo: hasRequiredBookingInfo(),
+        bookingFlowStarted,
+        bookingCompleted,
+      });
 
-    bookingFlowStarted = true;
-    logger.info('BOOKING_STARTED', {
-      name: currentAppointmentDetails.name,
-      email: currentAppointmentDetails.email,
-      phone: currentAppointmentDetails.phone,
-      appointmentDate: currentAppointmentDetails.appointmentDate,
-      appointmentTime: currentAppointmentDetails.appointmentTime,
-      reason: currentAppointmentDetails.reason,
-    });
+      if (!bookingConfirmed) {
+        logger.warn('BOOKING_EXECUTION_EXIT_CONFIRMATION_REQUIRED', {
+          trigger,
+          bookingConfirmed,
+          hasRequiredBookingInfo: hasRequiredBookingInfo(),
+          bookingFlowStarted,
+          bookingCompleted,
+          missingFields: getMissingBookingFields(),
+        });
+        return;
+      }
 
-    logger.info('BOOKING_EXECUTION_PRE_WEBHOOK', {
-      webhookUrl: bookingWebhookUrl,
-      bookingState: { ...currentAppointmentDetails },
-      activeOpenAIResponse: openai.hasActiveResponse,
-    });
+      logger.info('BOOKING_EXECUTION_PRE_START', {
+        trigger,
+        bookingState: { ...currentAppointmentDetails },
+        activeOpenAIResponse: openai.hasActiveResponse,
+      });
 
-    await submitBookingWebhook();
+      bookingFlowStarted = true;
+      logger.info('BOOKING_STARTED', {
+        trigger,
+        name: currentAppointmentDetails.name,
+        email: currentAppointmentDetails.email,
+        phone: currentAppointmentDetails.phone,
+        appointmentDate: currentAppointmentDetails.appointmentDate,
+        appointmentTime: currentAppointmentDetails.appointmentTime,
+        reason: currentAppointmentDetails.reason,
+      });
+
+      logger.info('BOOKING_EXECUTION_PRE_WEBHOOK', {
+        trigger,
+        webhookUrl: bookingWebhookUrl,
+        bookingState: { ...currentAppointmentDetails },
+        activeOpenAIResponse: openai.hasActiveResponse,
+      });
+
+      await submitBookingWebhook();
+    } catch (err) {
+      logger.error('BOOKING_EXECUTION_THROW_BEFORE_PRE_START', {
+        trigger,
+        error: err.message,
+        bookingCompleted,
+        bookingFlowStarted,
+        bookingConfirmed,
+        hasRequiredBookingInfo: hasRequiredBookingInfo(),
+        missingFields: getMissingBookingFields(),
+      });
+      throw err;
+    }
   }
 
   async function handleBookingConfirmation({ confirmation, transcript }) {
@@ -466,7 +564,16 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       missingFields,
     });
 
-    if (!confirmation) return;
+    if (!confirmation) {
+      logger.warn('BOOKING_CONFIRMATION_HANDLER_EXIT_NO_CONFIRMATION', {
+        transcript,
+        confirmationDetected: confirmation,
+        bookingConfirmed,
+        hasRequiredBookingInfo: hasRequiredBookingInfo(),
+        missingFields,
+      });
+      return { handled: false, reason: 'no_confirmation_detected' };
+    }
 
     if (!hasRequiredBookingInfo()) {
       logger.warn('Confirmation received but required booking info is missing', {
@@ -477,17 +584,30 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         expectedStateObject: 'currentAppointmentDetails',
           rootCauseHint: 'Structured booking sync payload did not provide all required fields.',
       });
-      return;
+      return { handled: false, reason: 'missing_required_booking_info', missingFields };
     }
 
-    if (bookingConfirmed) return;
+    if (bookingConfirmed) {
+      logger.warn('BOOKING_CONFIRMATION_HANDLER_EXIT_ALREADY_CONFIRMED', {
+        transcript,
+        confirmationDetected: confirmation,
+        bookingConfirmed,
+        hasRequiredBookingInfo: hasRequiredBookingInfo(),
+        missingFields,
+      });
+      return { handled: false, reason: 'already_confirmed' };
+    }
 
     logger.info('BOOKING_CONFIRMATION_SET_ATTEMPT', {
       beforeBookingConfirmed: bookingConfirmed,
       confirmation,
       transcript,
     });
-    bookingConfirmed = true;
+    setBookingConfirmed(true, 'explicit_user_confirmation', {
+      transcript,
+      confirmation,
+      source: 'handleBookingConfirmation',
+    });
     logger.info('BOOKING_CONFIRMATION_SET_RESULT', {
       afterBookingConfirmed: bookingConfirmed,
       transcript,
@@ -498,7 +618,8 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       missingFields: getMissingBookingFields(),
       activeOpenAIResponse: openai.hasActiveResponse,
     });
-    await maybeStartBookingFlow();
+    await maybeStartBookingFlow('post_confirmation_handler');
+    return { handled: true, reason: 'booking_confirmed_and_flow_attempted' };
   }
 
   function maybeAnnounceSummary() {
@@ -566,7 +687,10 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       );
     } catch (err) {
       bookingFlowStarted = false;
-      bookingConfirmed = false;
+      setBookingConfirmed(false, 'webhook_submission_failed', {
+        error: err.message,
+        source: 'submitBookingWebhook.catch',
+      });
       logger.error(`Webhook error: ${err.message}`);
       logger.error('BOOKING_WEBHOOK_FAILED', { error: err.message });
       sendOrQueueAssistantInstruction(
