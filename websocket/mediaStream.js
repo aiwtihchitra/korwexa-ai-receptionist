@@ -35,12 +35,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   let markCounter = 0;
   let finalGoodbyeDetected = false;
   let disconnectScheduled = false;
-  let bookingConfirmed = false;
   let bookingSummaryAnnounced = false;
   let appointmentDetailsCollected = false;
-  let bookingFlowStarted = false;
   let bookingCompleted = false;
-  let bookingExecutionInFlight = false;
   const pendingAssistantInstructions = [];
   let lastStructuredSyncAt = null;
   let lastStructuredSyncCallId = null;
@@ -62,26 +59,6 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     appointmentTime: null,
     reason: null,
   };
-
-  function setBookingConfirmed(nextValue, reason, context = {}) {
-    const previousValue = bookingConfirmed;
-    bookingConfirmed = nextValue;
-    logger.info('BOOKING_CONFIRMED_MUTATION', {
-      reason,
-      previousValue,
-      nextValue,
-      context,
-      bookingFlowStarted,
-      bookingCompleted,
-      hasRequiredBookingInfo: hasRequiredBookingInfo(),
-      missingFields: getMissingBookingFields(),
-    });
-  }
-
-  logger.info('BOOKING_CONFIRMED_INITIAL_STATE', {
-    bookingConfirmed,
-    reason: 'connection_initialized',
-  });
 
   const openai = new OpenAIRealtimeClient({
     config: config.openai,
@@ -141,7 +118,9 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
           partial,
           transcriptRaw: text,
         });
-        handleUserTranscript(text);
+        handleUserTranscript(text).catch((err) =>
+          logger.error('handleUserTranscript failed', { error: err.message })
+        );
       }
     }
   });
@@ -258,7 +237,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     }
   }
 
-  function handleUserTranscript(text) {
+  async function handleUserTranscript(text) {
     const normalized = text.trim();
     const name = parseName(normalized);
     const email = parseEmail(normalized);
@@ -267,6 +246,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     const appointmentDate = parseAppointmentDate(normalized);
     const appointmentTime = parseAppointmentTime(normalized);
     const confirmation = parseConfirmation(normalized);
+
     logger.info('BOOKING_CONFIRMATION_NORMALIZED_TRANSCRIPT', {
       transcriptRaw: text,
       transcriptNormalized: normalized,
@@ -282,6 +262,7 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       confirmationDetected: confirmation,
       parser: 'parseConfirmation',
     });
+
     let detailsUpdated = false;
 
     if (name) {
@@ -334,35 +315,36 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       transcript: normalized,
       confirmationDetected: confirmation,
       hasRequiredBookingInfo: hasRequiredBookingInfo(),
-      bookingConfirmed,
-      bookingFlowStarted,
       bookingCompleted,
       missingFields: getMissingBookingFields(),
     });
 
-    handleBookingConfirmation({ confirmation, transcript: normalized })
-      .then((result) => {
-        logger.info('BOOKING_CONFIRMATION_HANDLER_RESULT', {
-          transcript: normalized,
-          confirmation,
-          result,
-          bookingConfirmed,
-          bookingFlowStarted,
-          bookingCompleted,
+    // Direct execution: parseConfirmation() -> hasRequiredBookingInfo() ->
+    // bookingCompleted guard -> submitBookingWebhook(). No intermediate
+    // state machine.
+    if (confirmation) {
+      if (hasRequiredBookingInfo()) {
+        if (!bookingCompleted) {
+          logger.info('BOOKING_CONFIRMATION_RECEIVED_EXECUTING', {
+            transcript: normalized,
+            bookingState: { ...currentAppointmentDetails },
+          });
+          await submitBookingWebhook();
+        } else {
+          logger.warn('BOOKING_CONFIRMATION_IGNORED_ALREADY_COMPLETED', {
+            transcript: normalized,
+          });
+        }
+      } else {
+        logger.warn('Confirmation received but required booking info is missing', {
+          missingFields: getMissingBookingFields(),
         });
-      })
-      .catch((err) =>
-        logger.error('handleBookingConfirmation failed', { error: err.message })
-      );
-
-    // Re-check booking flow after processing the latest transcript
-    maybeStartBookingFlow('post_transcript_recheck').catch((err) =>
-      logger.error('maybeStartBookingFlow failed', { error: err.message, trigger: 'post_transcript_recheck' })
-    );
+      }
+    }
   }
 
   function parseName(text) {
-    const match = text.match(/(?:my name is|this is|i\'m|i am)\s+([A-Za-z][A-Za-z]+(?:[ '\-][A-Za-z]+){0,3})/i);
+    const match = text.match(/(?:my name is|this is|i'm|i am)\s+([A-Za-z][A-Za-z]+(?:[ '\-][A-Za-z]+){0,3})/i);
     return match ? match[1].trim() : null;
   }
 
@@ -421,13 +403,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function parseConfirmation(text) {
-  if (!text) return false;
+    if (!text) return false;
 
-  const normalized = text.toLowerCase().trim();
+    const normalized = text.toLowerCase().trim();
 
-  return /\b(yes|yeah|yep|yup|confirm|confirmed|sure|correct|that's right|thats right|that's correct|thats correct|absolutely|definitely|please do|please book|book it|do it|sounds good|that sounds good|that works|go ahead|okay|ok)\b/i.test(normalized);
+    return /\b(yes|yeah|yep|yup|confirm|confirmed|sure|correct|that's right|thats right|that's correct|thats correct|absolutely|definitely|please do|please book|book it|do it|sounds good|that sounds good|that works|go ahead|okay|ok)\b/i.test(normalized);
   }
-  
 
   function hasCustomerContactDetails() {
     return Boolean(
@@ -448,244 +429,12 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
     );
   }
 
-  async function maybeStartBookingFlow(trigger = 'unknown') {
-    try {
-      logger.info('BOOKING_EXECUTION_ENTER', {
-        trigger,
-        bookingCompleted,
-        bookingFlowStarted,
-        bookingExecutionInFlight,
-        hasRequiredBookingInfo: hasRequiredBookingInfo(),
-        bookingConfirmed,
-        missingFields: getMissingBookingFields(),
-        activeOpenAIResponse: openai.hasActiveResponse,
-      });
-
-      if (bookingCompleted || bookingExecutionInFlight) {
-        logger.warn('BOOKING_EXECUTION_EXIT_ALREADY_STARTED_OR_COMPLETED', {
-          trigger,
-          bookingCompleted,
-          bookingFlowStarted,
-          bookingExecutionInFlight,
-          bookingConfirmed,
-          hasRequiredBookingInfo: hasRequiredBookingInfo(),
-          missingFields: getMissingBookingFields(),
-        });
-        logger.info('BOOKING_EXECUTION_RETURN', {
-          line: 459,
-          reason: bookingCompleted ? 'bookingCompleted' : 'bookingExecutionInFlight',
-          bookingConfirmed,
-          bookingFlowStarted,
-          bookingExecutionInFlight,
-          bookingCompleted,
-          hasRequiredBookingInfo: hasRequiredBookingInfo(),
-          missingFields: getMissingBookingFields(),
-          trigger,
-        });
-        return;
-      }
-
-      if (!hasRequiredBookingInfo()) {
-        logger.warn('BOOKING_EXECUTION_EXIT_MISSING_REQUIRED_INFO', {
-          trigger,
-          bookingCompleted,
-          bookingFlowStarted,
-          bookingConfirmed,
-          hasRequiredBookingInfo: hasRequiredBookingInfo(),
-          missingFields: getMissingBookingFields(),
-          bookingState: { ...currentAppointmentDetails },
-        });
-        logger.info('BOOKING_EXECUTION_RETURN', {
-          line: 472,
-          reason: 'missingRequiredBookingInfo',
-          bookingConfirmed,
-          bookingFlowStarted,
-          bookingExecutionInFlight,
-          bookingCompleted,
-          hasRequiredBookingInfo: hasRequiredBookingInfo(),
-          missingFields: getMissingBookingFields(),
-          trigger,
-        });
-        return;
-      }
-
-      logger.info('BOOKING_EXECUTION_PRE_CONFIRMATION_GUARD', {
-        trigger,
-        bookingConfirmed,
-        hasRequiredBookingInfo: hasRequiredBookingInfo(),
-        bookingFlowStarted,
-        bookingCompleted,
-      });
-
-      if (!bookingConfirmed) {
-        logger.warn('BOOKING_EXECUTION_EXIT_CONFIRMATION_REQUIRED', {
-          trigger,
-          bookingConfirmed,
-          hasRequiredBookingInfo: hasRequiredBookingInfo(),
-          bookingFlowStarted,
-          bookingCompleted,
-          missingFields: getMissingBookingFields(),
-        });
-        logger.info('BOOKING_EXECUTION_RETURN', {
-          line: 493,
-          reason: 'bookingConfirmationRequired',
-          bookingConfirmed,
-          bookingFlowStarted,
-          bookingExecutionInFlight,
-          bookingCompleted,
-          hasRequiredBookingInfo: hasRequiredBookingInfo(),
-          missingFields: getMissingBookingFields(),
-          trigger,
-        });
-        return;
-      }
-
-      logger.info('BOOKING_EXECUTION_CONTINUE', {
-        line: 505,
-        reason: 'all_guards_passed',
-        bookingConfirmed,
-        bookingFlowStarted,
-        bookingExecutionInFlight,
-        bookingCompleted,
-        hasRequiredBookingInfo: hasRequiredBookingInfo(),
-        missingFields: getMissingBookingFields(),
-        trigger,
-      });
-
-      logger.info('BOOKING_EXECUTION_PRE_START', {
-        trigger,
-        bookingState: { ...currentAppointmentDetails },
-        activeOpenAIResponse: openai.hasActiveResponse,
-      });
-
-      bookingFlowStarted = true;
-      bookingExecutionInFlight = true;
-      logger.info('BOOKING_STARTED', {
-        trigger,
-        name: currentAppointmentDetails.name,
-        email: currentAppointmentDetails.email,
-        phone: currentAppointmentDetails.phone,
-        appointmentDate: currentAppointmentDetails.appointmentDate,
-        appointmentTime: currentAppointmentDetails.appointmentTime,
-        reason: currentAppointmentDetails.reason,
-      });
-
-      logger.info('BOOKING_EXECUTION_PRE_WEBHOOK', {
-        trigger,
-        webhookUrl: bookingWebhookUrl,
-        bookingState: { ...currentAppointmentDetails },
-        activeOpenAIResponse: openai.hasActiveResponse,
-      });
-
-      await submitBookingWebhook();
-      bookingExecutionInFlight = false;
-    } catch (err) {
-      bookingExecutionInFlight = false;
-      logger.error('BOOKING_EXECUTION_THROW_BEFORE_PRE_START', {
-        trigger,
-        error: err.message,
-        bookingCompleted,
-        bookingFlowStarted,
-        bookingExecutionInFlight,
-        bookingConfirmed,
-        hasRequiredBookingInfo: hasRequiredBookingInfo(),
-        missingFields: getMissingBookingFields(),
-      });
-      throw err;
-    }
-  }
-
-  async function handleBookingConfirmation({ confirmation, transcript }) {
-    const stateSnapshot = buildBookingStateSnapshot();
-    const missingFieldsInput = { ...currentAppointmentDetails };
-    const missingFields = getMissingBookingFieldsFor(missingFieldsInput);
-
-    logger.info('BOOKING_CONFIRMATION_STATE_TRACE', {
-      transcript,
-      bookingState: stateSnapshot.bookingState,
-      sessionState: stateSnapshot.sessionState,
-      fieldSources: stateSnapshot.fieldSources,
-      lastStructuredSyncAt: stateSnapshot.sessionState.lastStructuredSyncAt,
-      lastStructuredSyncCallId: stateSnapshot.sessionState.lastStructuredSyncCallId,
-      lastStructuredSyncPayload: stateSnapshot.sessionState.lastStructuredSyncPayload,
-      missingFieldsInput,
-      expectedStateObject: 'currentAppointmentDetails',
-      objectsWithRequiredFields: listObjectsContainingRequiredFields(stateSnapshot),
-    });
-
-    logger.info('Entering booking confirmation handler', {
-      transcript,
-      confirmationDetected: confirmation,
-      hasRequiredBookingInfo: hasRequiredBookingInfo(),
-      bookingConfirmed,
-      missingFields,
-    });
-
-    if (!confirmation) {
-      logger.warn('BOOKING_CONFIRMATION_HANDLER_EXIT_NO_CONFIRMATION', {
-        transcript,
-        confirmationDetected: confirmation,
-        bookingConfirmed,
-        hasRequiredBookingInfo: hasRequiredBookingInfo(),
-        missingFields,
-      });
-      return { handled: false, reason: 'no_confirmation_detected' };
-    }
-
-    if (!hasRequiredBookingInfo()) {
-      logger.warn('Confirmation received but required booking info is missing', {
-        missingFields,
-        bookingState: stateSnapshot.bookingState,
-        sessionState: stateSnapshot.sessionState,
-        fieldSources: stateSnapshot.fieldSources,
-        expectedStateObject: 'currentAppointmentDetails',
-          rootCauseHint: 'Structured booking sync payload did not provide all required fields.',
-      });
-      return { handled: false, reason: 'missing_required_booking_info', missingFields };
-    }
-
-    if (bookingConfirmed) {
-      logger.warn('BOOKING_CONFIRMATION_HANDLER_EXIT_ALREADY_CONFIRMED', {
-        transcript,
-        confirmationDetected: confirmation,
-        bookingConfirmed,
-        hasRequiredBookingInfo: hasRequiredBookingInfo(),
-        missingFields,
-      });
-      return { handled: false, reason: 'already_confirmed' };
-    }
-
-    logger.info('BOOKING_CONFIRMATION_SET_ATTEMPT', {
-      beforeBookingConfirmed: bookingConfirmed,
-      confirmation,
-      transcript,
-    });
-    setBookingConfirmed(true, 'explicit_user_confirmation', {
-      transcript,
-      confirmation,
-      source: 'handleBookingConfirmation',
-    });
-    logger.info('BOOKING_CONFIRMATION_SET_RESULT', {
-      afterBookingConfirmed: bookingConfirmed,
-      transcript,
-    });
-    logger.info('Booking details confirmed by caller');
-    logger.info('BOOKING_CONFIRMATION_EXECUTION_READY', {
-      bookingState: { ...currentAppointmentDetails },
-      missingFields: getMissingBookingFields(),
-      activeOpenAIResponse: openai.hasActiveResponse,
-    });
-    await maybeStartBookingFlow('post_confirmation_handler');
-    return { handled: true, reason: 'booking_confirmed_and_flow_attempted' };
-  }
-
   function maybeAnnounceSummary() {
     if (!hasRequiredBookingInfo() || bookingSummaryAnnounced) return;
     bookingSummaryAnnounced = true;
 
     sendOrQueueAssistantInstruction(
-      `I have the following details: ${currentAppointmentDetails.name}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone)}, email ${currentAppointmentDetails.email}, appointment date ${currentAppointmentDetails.appointmentDate}, appointment time ${currentAppointmentDetails.appointmentTime}, and reason ${currentAppointmentDetails.reason}. Shall I confirm your appointment?`
-      ,
+      `I have the following details: ${currentAppointmentDetails.name}, phone number ${formatPhoneForSpeech(currentAppointmentDetails.phone)}, email ${currentAppointmentDetails.email}, appointment date ${currentAppointmentDetails.appointmentDate}, appointment time ${currentAppointmentDetails.appointmentTime}, and reason ${currentAppointmentDetails.reason}. Shall I confirm your appointment?`,
       'booking_summary'
     );
   }
@@ -739,20 +488,14 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
       });
       logger.info('Goodbye initiated', { reason: 'booking completed via webhook' });
       sendOrQueueAssistantInstruction(
-        'Your appointment has been confirmed. You\'ll receive your confirmation shortly.',
+        "Your appointment has been confirmed. You'll receive your confirmation shortly.",
         'booking_success'
       );
     } catch (err) {
-      bookingFlowStarted = false;
-      setBookingConfirmed(false, 'webhook_submission_failed', {
-        error: err.message,
-        source: 'submitBookingWebhook.catch',
-      });
       logger.error(`Webhook error: ${err.message}`);
       logger.error('BOOKING_WEBHOOK_FAILED', { error: err.message });
       sendOrQueueAssistantInstruction(
-        `I\'m sorry, I couldn\'t confirm the appointment just now. ${err.message}. Please try again in a moment.`
-        ,
+        `I'm sorry, I couldn't confirm the appointment just now. ${err.message}. Please try again in a moment.`,
         'booking_error'
       );
     }
@@ -947,8 +690,6 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
         closed,
         bookingSummaryAnnounced,
         appointmentDetailsCollected,
-        bookingConfirmed,
-        bookingFlowStarted,
         bookingCompleted,
         lastStructuredSyncAt,
         lastStructuredSyncCallId,

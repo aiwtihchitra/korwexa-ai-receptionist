@@ -58,6 +58,18 @@ const BOOKING_STATE_TOOL = Object.freeze({
   },
 });
 
+const BOOK_APPOINTMENT_TOOL = Object.freeze({
+  type: 'function',
+  name: 'book_appointment',
+  description:
+    'Call this ONLY after all booking details have been collected and the customer explicitly confirms they want to book the appointment.',
+  parameters: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+});
+
 // Map the legacy shorthand ("g711_ulaw" / "g711_alaw" / "pcm16") to the GA
 // nested audio format object. Anything else is passed through unchanged so
 // operators can already supply a GA-shaped value from config if they want.
@@ -143,7 +155,10 @@ class OpenAIRealtimeClient extends EventEmitter {
         type: 'realtime',
         model: this.config.model,
         instructions: this.config.systemPrompt,
-        tools: [BOOKING_STATE_TOOL],
+        tools: [
+  BOOKING_STATE_TOOL,
+  BOOK_APPOINTMENT_TOOL,
+],
         tool_choice: 'auto',
         output_modalities: ['audio'],
         audio: {
