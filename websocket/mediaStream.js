@@ -421,8 +421,13 @@ function handleTwilioConnection(twilioWs, req, { config, logger: rootLogger }) {
   }
 
   function parseConfirmation(text) {
-    return /\b(yes|confirm|sure|please do|that sounds good|that works|sounds good|go ahead)\b/i.test(text);
+  if (!text) return false;
+
+  const normalized = text.toLowerCase().trim();
+
+  return /\b(yes|yeah|yep|yup|confirm|confirmed|sure|correct|that's right|thats right|that's correct|thats correct|absolutely|definitely|please do|please book|book it|do it|sounds good|that sounds good|that works|go ahead|okay|ok)\b/i.test(normalized);
   }
+  
 
   function hasCustomerContactDetails() {
     return Boolean(
