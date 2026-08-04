@@ -36,7 +36,10 @@ Do not say anything before or after that exact opening line on the first turn.
 - After checking the calendar, tell the caller only actual available slots from the real Google Calendar.
 - Do not invent appointment times.
 - If the schedule is fully booked, say so and offer alternate days.
-- Do not wait for the caller to repeat themselves before continuing.
+- Wait until the caller has clearly finished speaking before responding.
+- Never interrupt the caller while they are speaking.
+- Ask only one question at a time.
+- If the caller pauses briefly while thinking, continue listening instead of assuming they have finished.
 - Always sound human, natural, and calm.
 
 ## Booking and confirmation
@@ -114,13 +117,13 @@ const config = Object.freeze({
     businessName: BUSINESS_NAME,
     receptionistName: RECEPTIONIST_NAME,
     greeting: `Hello, thank you for calling ${BUSINESS_NAME}. This is ${RECEPTIONIST_NAME}. How may I assist you today?`,
-    turnDetection: {
-      type: 'server_vad',
-      threshold: 0.5,
-      prefix_padding_ms: 300,
-      silence_duration_ms: 500,
-      create_response: true,
-    },
+   turnDetection: {
+  type: 'server_vad',
+  threshold: 0.5,
+  prefix_padding_ms: 300,
+  silence_duration_ms: 1000,
+  create_response: true,
+ },
     // Reconnect (exponential backoff, capped)
     reconnect: {
       enabled: true,
